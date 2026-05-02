@@ -539,7 +539,12 @@ app.post("/apify/launch", async (req, res) => {
   const { titles = [], industries = [], countries = [], keywords = "", maxPages = 5 } = req.body;
   const fetchCount = Math.min(maxPages * 25, 100); // 無料枠100件/runまで
 
-  console.log(`🚀 Apify Actor起動: titles=${titles.length} industries=${industries.length} countries=${countries.length} fetchCount=${fetchCount}`);
+  // leads-finder の enum は全部小文字
+  const lc = arr => (Array.isArray(arr) ? arr : []).map(s => String(s || "").toLowerCase().trim()).filter(Boolean);
+  const countriesLc  = lc(countries);
+  const industriesLc = lc(industries);
+
+  console.log(`🚀 Apify Actor起動: titles=${titles.length} industries=${industriesLc.length} countries=${countriesLc.length} fetchCount=${fetchCount}`);
 
   // Webhookエンドポイント（Actor完了時に呼ばれる）
   const webhookUrl = `https://sales-automation-server-production.up.railway.app/webhook/apify-import`;
@@ -554,9 +559,9 @@ app.post("/apify/launch", async (req, res) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contact_job_title:  titles,
-          company_industry:   industries,
-          contact_location:   countries,
-          company_keywords:   keywords,
+          company_industry:   industriesLc,
+          contact_location:   countriesLc,
+          company_keywords:   keywords ? [keywords] : [],
           fetch_count:        fetchCount,
           // Webhook設定: 完了時に自動でimportエンドポイントを呼ぶ
           webhooks: [{
