@@ -537,32 +537,27 @@ app.post("/apify/launch", async (req, res) => {
   }
 
   const { titles = [], industries = [], countries = [], keywords = "", maxPages = 5 } = req.body;
+  const fetchCount = Math.min(maxPages * 25, 100); // 無料枠100件/runまで
 
-  // Apollo検索URLを組み立て
-  const parts = [];
-  titles.forEach(t     => parts.push(`personTitles[]=${encodeURIComponent(t)}`));
-  industries.forEach(i => parts.push(`organizationIndustryTagIds[]=${encodeURIComponent(i)}`));
-  countries.forEach(c  => parts.push(`personLocations[]=${encodeURIComponent(c)}`));
-  if (keywords) parts.push(`qKeywords=${encodeURIComponent(keywords)}`);
-  parts.push("page=1", "sortAscending=false", "sortByField=%5Bnone%5D");
-
-  const apolloUrl = `https://app.apollo.io/#/people?${parts.join("&")}`;
-  console.log(`🚀 Apify Actor起動: ${apolloUrl}`);
+  console.log(`🚀 Apify Actor起動: titles=${titles.length} industries=${industries.length} countries=${countries.length} fetchCount=${fetchCount}`);
 
   // Webhookエンドポイント（Actor完了時に呼ばれる）
   const webhookUrl = `https://sales-automation-server-production.up.railway.app/webhook/apify-import`;
 
   try {
-    // pratikdani/apollo-io-people-profile-scraper を起動
-    const actorId = "pratikdani~apollo-io-people-profile-scraper";
+    // code_crafter/leads-finder を起動（無料枠1run100件まで、$1.5/1000件 PPR）
+    const actorId = "code_crafter~leads-finder";
     const runRes = await fetch(
       `https://api.apify.com/v2/acts/${actorId}/runs?token=${apifyToken}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          searchUrl:  apolloUrl,
-          maxResults: maxPages * 25, // 1ページ約25件
+          contact_job_title:  titles,
+          company_industry:   industries,
+          contact_location:   countries,
+          company_keywords:   keywords,
+          fetch_count:        fetchCount,
           // Webhook設定: 完了時に自動でimportエンドポイントを呼ぶ
           webhooks: [{
             eventTypes: ["ACTOR.RUN.SUCCEEDED"],
@@ -585,7 +580,6 @@ app.post("/apify/launch", async (req, res) => {
     res.json({
       ok:        true,
       runId,
-      apolloUrl,
       actorId,
       message:   "Apify Actorを起動しました。完了後に自動でインポートされます。",
     });
@@ -675,10 +669,10 @@ app.post("/webhook/apify-import", async (req, res) => {
       const firstName  = r["First Name"]  || r.firstName  || r.first_name  || "";
       const lastName   = r["Last Name"]   || r.lastName   || r.last_name   || "";
       const name       = (r.name || r.Name || `${firstName} ${lastName}`).trim() || "（名前未設定）";
-      const email      = (r.email || r.Email || r["Work Email"] || r["Email Address"] || "").toLowerCase().trim();
+      const email      = (r.email || r.Email || r["Work Email"] || r["Email Address"] || r.personal_email || "").toLowerCase().trim();
       const linkedin   = r["LinkedIn Url"] || r["Person Linkedin Url"] || r.linkedin || r.linkedinUrl || r.linkedin_url || "";
-      const company    = r.company || r.Company || r["Company Name"] || r.organization || "";
-      const title      = r.title || r.Title || r["Job Title"] || r.jobTitle || "";
+      const company    = r.company || r.Company || r["Company Name"] || r.company_name || r.organization || "";
+      const title      = r.title || r.Title || r["Job Title"] || r.jobTitle || r.job_title || "";
       const country    = r.country || r.Country || r.location || r.Location || "";
       const industry   = r.industry || r.Industry || "";
       const domain     = r.domain || r.website || r.Website || r["Company Website"] || "";
