@@ -1,0 +1,14 @@
+node_modules
+sales-tool
+.git
+*.log
+.env
+.env.*
+client_secret*.json
+ga_service_account.json
+cloudflared.exe.exe
+workspace
+.claude
+server_local.js
+sales-automation.jsx
+

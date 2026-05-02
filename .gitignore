@@ -1,0 +1,15 @@
+node_modules/
+sales-tool/node_modules/
+sales-tool/dist/
+*.log
+.env
+.env.*
+client_secret*.json
+ga_service_account.json
+*.exe
+*.exe.exe
+.claude/
+workspace/
+server_local.js
+sales-automation.jsx
+.railway/
