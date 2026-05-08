@@ -240,7 +240,7 @@ const LINKEDIN_GROUPS = [
   { label: "🔗 反応あり",                   filter: c => !!(c.linkedin || c.linkedinUrl) && !!c.clicked },
 ];
 
-const RAILWAY = "https://sales-automation-server-production.up.railway.app";
+const RAILWAY = "http://178.104.65.99:3000";
 const LOCAL_SEND = "http://localhost:3002";
 
 // ────────────────────────────────────────────────────────────
