@@ -1636,6 +1636,7 @@ function IntentSearchTab({ settings, crm, setCrm, prefill }) {
             title: c.title || "",
             company: c.company || "",
             linkedinUrl: c.linkedinUrl || "",
+            rawTitle: (c.rawTitle || "").slice(0, 150),
             rawSnippet: (c.rawSnippet || c.rawTitle || "").slice(0, 120),
           })),
         }),

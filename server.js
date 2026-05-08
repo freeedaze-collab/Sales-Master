@@ -2144,14 +2144,19 @@ function parseLinkedInCandidate(item) {
 
   // --- 会社名の抽出（現職のみ） ---
   let company = "";
-  const atMatch =
-    currentSnippet.match(/(?:at|@)\s+([A-Za-z0-9\s\.,&\-']{2,50?}?)(?:\s*[·|\n]|$)/i) ||
-    rawTitle.match(/(?:at|@)\s+([A-Za-z0-9\s\.,&\-']{2,50?}?)(?:\s*[·|\-|\|]|$)/i);
-  if (atMatch) {
-    company = atMatch[1].trim();
-    // HTMLエンティティのクリーン
-    company = company.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+  // "Name - Company | LinkedIn" 形式（Brave SearchのLinkedInタイトル）
+  const dashMatch = rawTitle.match(/^.+?\s+-\s+(.+?)\s*(?:\||·|$)/);
+  if (dashMatch) {
+    company = dashMatch[1].replace(/\bLinkedIn\b/i, "").trim();
   }
+  // スニペットの "at Company" 形式（補完）
+  if (!company) {
+    const atMatch =
+      currentSnippet.match(/(?:at|@)\s+([A-Za-z0-9\s\.,&\-']{2,50?}?)(?:\s*[·|\n]|$)/i) ||
+      rawTitle.match(/(?:at|@)\s+([A-Za-z0-9\s\.,&\-']{2,50?}?)(?:\s*[·|\-|\|]|$)/i);
+    if (atMatch) company = atMatch[1].trim();
+  }
+  company = company.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, "").trim();
 
   // --- ドメイン推測 ---
   let guessedDomain = "";
@@ -2460,7 +2465,7 @@ app.post("/search/guess-domains", async (req, res) => {
 
   try {
     const lines = candidateList.map((c, i) =>
-      `${i}. ${c.name} | ${c.title || "?"} | ${c.company || "?"} | LinkedIn: ${c.linkedinUrl || "?"} | snippet: ${(c.rawSnippet || "").slice(0, 120)}`
+      `${i}. ${c.name} | ${c.title || "?"} | ${c.company || "?"} | LinkedIn: ${c.linkedinUrl || "?"} | title: ${(c.rawTitle || "").slice(0, 120)} | snippet: ${(c.rawSnippet || "").slice(0, 120)}`
     ).join("\n");
 
     const prompt = `以下のLinkedInプロフィールの人物について、**現在の所属企業のメールドメイン**を特定・推測してください。
