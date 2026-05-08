@@ -2501,6 +2501,48 @@ function ListTab({ crm, setCrm }) {
   const [csvResult, setCsvResult] = useState(null);
   const csvInputRef = useRef(null);
 
+  // ── メアド編集（インライン） ──
+  const [editingEmailId, setEditingEmailId] = useState(null);
+  const [editingEmailValue, setEditingEmailValue] = useState("");
+  const [reverifyingId, setReverifyingId] = useState(null);
+
+  // メアド保存 + ステータス unverified にリセット + 検証ワーカーキック
+  const saveEmailEdit = (contact) => {
+    const newEmail = (editingEmailValue || "").toLowerCase().trim();
+    setEditingEmailId(null);
+    if (newEmail === (contact.email || "")) return;  // 変更なし
+
+    // 簡易バリデーション
+    if (newEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+      alert("メールアドレスの形式が正しくありません");
+      return;
+    }
+
+    // 重複チェック（自分自身は除外）
+    const dup = crm.find(c => c.id !== contact.id && (c.email || "").toLowerCase() === newEmail);
+    if (newEmail && dup) {
+      alert(`このメールアドレスは既に登録されています: ${dup.name || dup.id}`);
+      return;
+    }
+
+    // email 更新 + ステータスを unverified にリセット
+    setCrm(prev => prev.map(c =>
+      c.id === contact.id ? { ...c, email: newEmail, status: newEmail ? "unverified" : c.status } : c
+    ));
+
+    // 検証ワーカーをキック
+    if (newEmail) {
+      setReverifyingId(contact.id);
+      setTimeout(() => {
+        fetch(`${RAILWAY}/webhook/verify-trigger`, { method: "POST" })
+          .then(r => r.json())
+          .then(d => console.log("re-verify trigger:", d))
+          .catch(err => console.warn("verify-trigger 失敗:", err.message))
+          .finally(() => setTimeout(() => setReverifyingId(null), 2000));
+      }, 1500);
+    }
+  };
+
   // ── 一括クリーニング（検証）──
   const [cleaning, setCleaning] = useState(false);
   const [cleanProgress, setCleanProgress] = useState(null);
@@ -2514,8 +2556,52 @@ function ListTab({ crm, setCrm }) {
   const [verifyStatus, setVerifyStatus] = useState(null); // { workerRunning, unverifiedCount }
   const verifyStatusRef = useRef(null);
 
+  // ── Xアカウント一括特定 ──
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [xFinding, setXFinding] = useState(false);
+  const [xFindResult, setXFindResult] = useState(null); // { found, total }
+
   const update = (id, k, v) => setCrm(prev => prev.map(c => c.id === id ? { ...c, [k]: v } : c));
   const remove = id => setCrm(prev => prev.filter(c => c.id !== id));
+
+  const toggleSelect = (id) => setSelectedIds(prev => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+
+  const toggleSelectAll = (ids) => setSelectedIds(prev =>
+    prev.size === ids.length ? new Set() : new Set(ids)
+  );
+
+  const findXAccounts = async () => {
+    const targets = crm
+      .filter(c => selectedIds.has(c.id))
+      .map(c => ({ id: c.id, name: c.name, company: c.company || "", title: c.title || "" }));
+    if (targets.length === 0) return;
+    setXFinding(true);
+    setXFindResult(null);
+    try {
+      const res = await fetch(`${RAILWAY}/search/find-x-accounts-batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targets }),
+      });
+      const data = await res.json();
+      const matches = data.matches || [];
+      if (matches.length > 0) {
+        setCrm(prev => prev.map(c => {
+          const m = matches.find(x => x.id === c.id);
+          return m ? { ...c, xUrl: m.matchUrl } : c;
+        }));
+      }
+      setXFindResult({ found: matches.length, total: targets.length });
+    } catch (err) {
+      alert("Xアカウント特定に失敗しました: " + err.message);
+    } finally {
+      setXFinding(false);
+    }
+  };
 
   const activeFilter = FILTER_OPTIONS[filterIdx];
   const filtered = applyFilter(crm, activeFilter);
@@ -2615,23 +2701,28 @@ function ListTab({ crm, setCrm }) {
       h.trim().replace(/^["']|["']$/g, "").replace(/^\uFEFF/, "")
     );
 
-    // Apollo CSVの代表的なカラム名をマッピング
+    // Apollo / Magically / ExportApollo 系の代表的なカラム名をマッピング
+    // ヘッダーの大小文字・スペース・アンダースコア違いを吸収
+    const normalize = s => String(s || "").toLowerCase().replace(/[\s_-]+/g, "");
+    const normalizedHeaders = rawHeaders.map(normalize);
     const colIndex = (candidates) => {
       for (const c of candidates) {
-        const i = rawHeaders.findIndex(h => h.toLowerCase() === c.toLowerCase());
+        const target = normalize(c);
+        const i = normalizedHeaders.findIndex(h => h === target);
         if (i >= 0) return i;
       }
       return -1;
     };
 
     const COL = {
-      firstName:   colIndex(["First Name", "first_name", "firstname"]),
-      lastName:    colIndex(["Last Name",  "last_name",  "lastname"]),
-      title:       colIndex(["Title", "Job Title", "job_title"]),
-      company:     colIndex(["Company", "Company Name", "company_name", "Organization"]),
-      email:       colIndex(["Email", "Email Address", "email_address", "Work Email"]),
-      domain:      colIndex(["Website", "Company Website", "website", "domain"]),
-      linkedin:    colIndex(["LinkedIn Url", "Person Linkedin Url", "linkedin_url", "LinkedIn URL", "LinkedIn"]),
+      firstName:   colIndex(["First Name", "first_name", "firstname", "FirstName"]),
+      lastName:    colIndex(["Last Name",  "last_name",  "lastname",  "LastName"]),
+      fullName:    colIndex(["Name", "Full Name", "fullname"]),
+      title:       colIndex(["Title", "Job Title", "job_title", "JobTitle"]),
+      company:     colIndex(["Company", "Company Name", "company_name", "Organization", "CompanyName"]),
+      email:       colIndex(["Verified Email", "verified_email", "Email", "Work Email", "Email Address", "email_address", "WorkEmail"]),
+      domain:      colIndex(["Website", "Company Website", "website", "domain", "CompanyWebsite"]),
+      linkedin:    colIndex(["LinkedIn Url", "Person Linkedin Url", "linkedin_url", "LinkedIn URL", "LinkedIn", "PersonLinkedinUrl", "LinkedInUrl"]),
       country:     colIndex(["Country", "country"]),
       industry:    colIndex(["Industry", "industry"]),
     };
@@ -2655,7 +2746,10 @@ function ListTab({ crm, setCrm }) {
 
       const firstName = getCell(cols, COL.firstName);
       const lastName  = getCell(cols, COL.lastName);
-      const name = [firstName, lastName].filter(Boolean).join(" ") || "（名前未設定）";
+      const fullName  = getCell(cols, COL.fullName);
+      const name = [firstName, lastName].filter(Boolean).join(" ").trim()
+                || fullName
+                || "（名前未設定）";
 
       return {
         name,
@@ -2670,9 +2764,13 @@ function ListTab({ crm, setCrm }) {
     }).filter(r => r.email || r.linkedinUrl); // メアドかLinkedInのどちらかがあるもの
   };
 
-  const handleCsvImport = (e) => {
-    const file = e.target.files?.[0];
+  // CSV ファイルを実際にパース＆インポートする共通処理
+  const processCsvFile = (file) => {
     if (!file) return;
+    if (!/\.csv$/i.test(file.name)) {
+      alert("CSV ファイル（.csv）を指定してください");
+      return;
+    }
     setCsvImporting(true);
     setCsvResult(null);
 
@@ -2723,13 +2821,19 @@ function ListTab({ crm, setCrm }) {
 
         if (newContacts.length > 0) {
           setCrm(prev => [...prev, ...newContacts]);
+          // Supabase upsert が完了するのを待ってから検証ワーカーをキック
+          setTimeout(() => {
+            fetch(`${RAILWAY}/webhook/verify-trigger`, { method: "POST" })
+              .then(r => r.json())
+              .then(d => console.log("verify-trigger:", d))
+              .catch(err => console.warn("verify-trigger 失敗:", err.message));
+          }, 1500);
         }
-        setCsvResult({ added, skipped, total: parsed.length });
+        setCsvResult({ added, skipped, total: parsed.length, fileName: file.name });
       } catch (err) {
         alert("CSVパースエラー: " + err.message);
       } finally {
         setCsvImporting(false);
-        // ファイル入力をリセット（同じファイルを再選択可能にする）
         if (csvInputRef.current) csvInputRef.current.value = "";
       }
     };
@@ -2739,6 +2843,55 @@ function ListTab({ crm, setCrm }) {
     };
     reader.readAsText(file, "UTF-8");
   };
+
+  const handleCsvImport = (e) => {
+    processCsvFile(e.target.files?.[0]);
+  };
+
+  // ── ドラッグ&ドロップでの CSV インポート ──
+  const [isDragging, setIsDragging] = useState(false);
+  const dragCounterRef = useRef(0);
+
+  useEffect(() => {
+    const onDragEnter = (e) => {
+      e.preventDefault();
+      // ファイル系のドラッグのみ反応
+      if (!e.dataTransfer?.types?.includes("Files")) return;
+      dragCounterRef.current++;
+      if (dragCounterRef.current === 1) setIsDragging(true);
+    };
+    const onDragLeave = (e) => {
+      e.preventDefault();
+      dragCounterRef.current--;
+      if (dragCounterRef.current <= 0) {
+        dragCounterRef.current = 0;
+        setIsDragging(false);
+      }
+    };
+    const onDragOver = (e) => {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    };
+    const onDrop = (e) => {
+      e.preventDefault();
+      dragCounterRef.current = 0;
+      setIsDragging(false);
+      const file = e.dataTransfer?.files?.[0];
+      if (file) processCsvFile(file);
+    };
+
+    window.addEventListener("dragenter", onDragEnter);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("drop", onDrop);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [crm]);  // crm を依存に入れて重複判定を最新にする (processCsvFile は同 crm closure を共有)
 
   // ────────────────────────────────────────────
   // 一括クリーニング（未検証リードを検証API呼び出し）
@@ -2817,6 +2970,32 @@ function ListTab({ crm, setCrm }) {
 
   return (
     <div>
+      {/* ── ドラッグ&ドロップ オーバーレイ ── */}
+      {isDragging && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 9999,
+          background: "rgba(24, 95, 165, 0.85)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          pointerEvents: "none",
+          backdropFilter: "blur(4px)",
+        }}>
+          <div style={{
+            padding: "32px 48px", borderRadius: 16,
+            background: "#fff",
+            border: "3px dashed #185FA5",
+            textAlign: "center", maxWidth: 520,
+          }}>
+            <div style={{ fontSize: 48, lineHeight: 1, marginBottom: 12 }}>📥</div>
+            <div style={{ fontSize: 18, fontWeight: 600, color: "#0C447C", marginBottom: 6 }}>
+              CSV ファイルをドロップしてインポート
+            </div>
+            <div style={{ fontSize: 13, color: "#378ADD" }}>
+              Apollo / Magically / ExportApollo の CSV 出力に対応
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── ツールバー ── */}
       <div style={{ marginBottom: 12 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
@@ -2899,6 +3078,25 @@ function ListTab({ crm, setCrm }) {
                 ? `🔍 検証中 ${cleanProgress?.done}/${cleanProgress?.total}件...`
                 : `🧹 未検証リストをクリーニング${unverifiedCount > 0 ? ` (${unverifiedCount}件)` : ""}`}
             </button>
+            {/* ── Xアカウント一括特定ボタン ── */}
+            <button
+              onClick={findXAccounts}
+              disabled={xFinding || selectedIds.size === 0}
+              style={{
+                fontSize: 12, padding: "6px 14px",
+                background: xFinding ? "var(--color-background-secondary)" :
+                            selectedIds.size > 0 ? "#000" : undefined,
+                color: xFinding ? "var(--color-text-secondary)" :
+                       selectedIds.size > 0 ? "#fff" : undefined,
+                border: selectedIds.size === 0 ? "0.5px solid var(--color-border-tertiary)" : "none",
+                borderRadius: 8, fontWeight: 500,
+                opacity: (xFinding || selectedIds.size === 0) ? 0.6 : 1,
+                cursor: (xFinding || selectedIds.size === 0) ? "default" : "pointer",
+              }}>
+              {xFinding
+                ? "🎯 特定中..."
+                : `𝕏 Xアカウント一括特定${selectedIds.size > 0 ? ` (${selectedIds.size}件)` : ""}`}
+            </button>
             <button onClick={() => setShowAddForm(v => !v)} style={{ fontSize: 12, padding: "6px 14px" }}>
               {showAddForm ? "キャンセル" : "+ 手動で追加"}
             </button>
@@ -2957,6 +3155,23 @@ function ListTab({ crm, setCrm }) {
         }}>
           <span>🔌 拡張機能から <strong>{extResult.added}件</strong> 追加、スキップ（重複）: {extResult.skipped}件</span>
           <button onClick={() => setExtResult(null)} style={{ fontSize: 11, background: "none", border: "none", cursor: "pointer", color: "inherit" }}>✕</button>
+        </div>
+      )}
+
+      {/* ── Xアカウント特定 結果バナー ── */}
+      {xFindResult && (
+        <div style={{
+          marginBottom: 12, padding: "10px 14px", borderRadius: 8,
+          background: xFindResult.found > 0 ? "#000" : "#F1EFE8",
+          color: xFindResult.found > 0 ? "#fff" : "#444441",
+          fontSize: 13, display: "flex", alignItems: "center", justifyContent: "space-between",
+        }}>
+          <span>
+            𝕏 Xアカウント特定完了 — マッチ: <strong>{xFindResult.found}件</strong> / 対象 {xFindResult.total}件
+            {xFindResult.found > 0 && " — 各リードに𝕏リンクが追加されました"}
+          </span>
+          <button onClick={() => setXFindResult(null)}
+            style={{ fontSize: 11, background: "none", border: "none", cursor: "pointer", color: "inherit", padding: "0 4px" }}>✕</button>
         </div>
       )}
 
@@ -3033,9 +3248,27 @@ function ListTab({ crm, setCrm }) {
         <Card><p style={{ color: "var(--color-text-secondary)", fontSize: 14, margin: 0 }}>{activeFilter.type === "all" ? "リストが空です。「手動で追加」または企業検索タブから追加してください。" : `「${activeFilter.label}」に該当するリストがありません。`}</p></Card>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {/* ── 全選択チェックボックス ── */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 2px" }}>
+            <input
+              type="checkbox"
+              checked={selectedIds.size === filtered.length && filtered.length > 0}
+              onChange={() => toggleSelectAll(filtered.map(p => p.id))}
+              style={{ cursor: "pointer", width: 14, height: 14 }}
+            />
+            <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>
+              {selectedIds.size > 0 ? `${selectedIds.size}件選択中` : "全選択"}
+            </span>
+          </div>
           {filtered.map(p => (
             <Card key={p.id}>
               <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+                <input
+                  type="checkbox"
+                  checked={selectedIds.has(p.id)}
+                  onChange={() => toggleSelect(p.id)}
+                  style={{ cursor: "pointer", marginTop: 3, width: 14, height: 14, flexShrink: 0 }}
+                />
                 <Avatar name={p.name} />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
@@ -3052,8 +3285,53 @@ function ListTab({ crm, setCrm }) {
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap", alignItems: "center" }}>
-                    {p.email && <span style={{ fontSize: 11, color: "var(--color-text-info)" }}>{p.email}</span>}
+                    {/* メアド: クリックで編集可能 */}
+                    {editingEmailId === p.id ? (
+                      <input
+                        autoFocus
+                        type="email"
+                        value={editingEmailValue}
+                        placeholder="メアドを入力（空欄で削除）"
+                        onChange={e => setEditingEmailValue(e.target.value)}
+                        onBlur={() => saveEmailEdit(p)}
+                        onKeyDown={e => {
+                          if (e.key === "Enter") { e.preventDefault(); e.target.blur(); }
+                          if (e.key === "Escape") { setEditingEmailId(null); }
+                        }}
+                        style={{
+                          fontSize: 11, padding: "2px 6px",
+                          border: "1px solid #185FA5", borderRadius: 4,
+                          minWidth: 220, background: "#fff",
+                        }}
+                      />
+                    ) : (
+                      <span
+                        onClick={() => { setEditingEmailId(p.id); setEditingEmailValue(p.email || ""); }}
+                        title={p.email ? "クリックして編集" : "クリックしてメアドを入力"}
+                        style={{
+                          fontSize: 11,
+                          color: p.email ? "var(--color-text-info)" : "var(--color-text-tertiary)",
+                          cursor: "pointer",
+                          padding: "1px 4px",
+                          borderRadius: 4,
+                          borderBottom: "1px dashed transparent",
+                        }}
+                        onMouseEnter={e => e.currentTarget.style.borderBottom = "1px dashed var(--color-text-secondary)"}
+                        onMouseLeave={e => e.currentTarget.style.borderBottom = "1px dashed transparent"}
+                      >
+                        {p.email || "✏️ メアド未入力（クリックで追加）"}
+                      </span>
+                    )}
+                    {reverifyingId === p.id && (
+                      <span style={{ fontSize: 10, color: "#7C3AED" }}>🔍 再検証中...</span>
+                    )}
                     {p.linkedin && <a href={p.linkedin} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--color-text-secondary)" }}>LinkedIn ↗</a>}
+                    {p.xUrl && (
+                      <a href={p.xUrl} target="_blank" rel="noreferrer"
+                        style={{ fontSize: 12, fontWeight: 700, color: "#fff", background: "#000", padding: "1px 7px", borderRadius: 4, textDecoration: "none", letterSpacing: "-0.5px" }}>
+                        𝕏
+                      </a>
+                    )}
                     <span style={{ fontSize: 11, color: "var(--color-text-tertiary)" }}>{p.industry} · {p.country}</span>
                     {p.status === "unverified" && <span style={{ fontSize: 11, background: "#F5F0FF", color: "#6B21A8", padding: "2px 7px", borderRadius: 4, fontWeight: 500 }}>🔬 未検証</span>}
                     {p.status === "ready"      && <span style={{ fontSize: 11, background: "#DCFCE7", color: "#166534", padding: "2px 7px", borderRadius: 4, fontWeight: 500 }}>✅ 送信待ち</span>}
@@ -4544,9 +4822,10 @@ function CrmTab({ crm }) {
   const totalScore = crm.reduce((s, c) => s + calcScore(c), 0);
 
   const exportCsv = () => {
-    const header = "名前,役職,会社,業界,メール,LinkedIn,ステータス,スコア,クリック,複数回開封,サイト訪問,複数ページ閲覧,スクロール,CV済み,プラン,国,キャンペーン,バリアント,検索意図,コンテキスト要約,メモ,追加日";
+    const header = "名前,役職,会社,業界,メール,LinkedIn,X(Twitter),ステータス,スコア,クリック,複数回開封,サイト訪問,複数ページ閲覧,スクロール,CV済み,プラン,国,キャンペーン,バリアント,検索意図,コンテキスト要約,メモ,追加日";
     const rows = crm.map(c => [
       c.name, c.title, c.company, c.industry, c.email, c.linkedin,
+      c.xUrl || "—",
       c.status, calcScore(c),
       c.clicked ? "済" : "未",
       (c.opens || 0) >= 2 ? "済" : "未",

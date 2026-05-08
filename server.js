@@ -318,7 +318,84 @@ app.get("/leads/pending", (req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// 単一メアド検証 — MillionVerifier / モックフォールバック
+// メアド検証ヘルパー — VERIFY_PROVIDER で切替
+//   VERIFY_PROVIDER=millionverifier (default) | reoon
+//   VERIFY_API_KEY=...
+// 戻り値: { valid: boolean, status: string, reason: string, raw?: any, mock?: boolean }
+// ══════════════════════════════════════════════
+async function verifyEmailViaProvider(email) {
+  const verifyKey = process.env.VERIFY_API_KEY || CONFIG.EMAILVERIFY_API_KEY || "";
+  const provider = (process.env.VERIFY_PROVIDER || "millionverifier").toLowerCase().trim();
+
+  if (!verifyKey) {
+    // 危険: モックで全件 valid 扱いはしない。unknown で返し、呼び出し側で unverified のまま留める
+    return {
+      valid: false,
+      status: "unknown",
+      reason: "no_api_key",
+      mock: true,
+    };
+  }
+
+  try {
+    if (provider === "reoon") {
+      // Reoon Email Verifier — https://emailverifier.reoon.com/
+      // mode=power が SMTP 検証あり、quick はキャッシュベース
+      const mode = (process.env.REOON_MODE || "power").toLowerCase();
+      const url = `https://emailverifier.reoon.com/api/v1/verify?email=${encodeURIComponent(email)}&key=${encodeURIComponent(verifyKey)}&mode=${encodeURIComponent(mode)}`;
+      const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+      if (!r.ok) {
+        const errText = await r.text();
+        console.error(`Reoon HTTP ${r.status}:`, errText.slice(0, 200));
+        return { valid: false, status: "unknown", reason: `api_error_${r.status}` };
+      }
+      const data = await r.json();
+      // Reoon レスポンス: { status: "safe"|"valid"|"invalid"|"risky"|"unknown"|"disposable"|... }
+      const raw = String(data.status || data.result || "unknown").toLowerCase().trim();
+      const isValid = raw === "safe" || raw === "valid" || raw === "deliverable";
+      return {
+        valid: isValid,
+        status: raw,
+        reason: isValid ? "valid" :
+                raw === "risky" ? "risky" :
+                raw === "disposable" ? "disposable" :
+                raw === "role_account" || raw === "role" ? "role_based" :
+                raw === "catch_all" || raw === "catch-all" ? "catch_all" :
+                raw === "unknown" ? "unknown" :
+                "invalid",
+        raw: data,
+      };
+    }
+
+    // 既定: MillionVerifier
+    const url = `https://api.millionverifier.com/api/v3/?api=${encodeURIComponent(verifyKey)}&email=${encodeURIComponent(email)}&timeout=10`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error(`MillionVerifier HTTP ${r.status}:`, errText.slice(0, 200));
+      return { valid: false, status: "unknown", reason: `api_error_${r.status}` };
+    }
+    const data = await r.json();
+    const raw = String(data.result || data.status || "unknown").toLowerCase().trim();
+    const isValid = raw === "ok" || raw === "valid" || raw === "deliverable";
+    return {
+      valid: isValid,
+      status: raw,
+      reason: isValid ? "valid" :
+              raw === "unknown" || raw === "unknown_email" ? "unknown" :
+              raw === "catch_all" ? "catch_all" :
+              raw === "disposable" ? "disposable" :
+              "invalid",
+      raw: data,
+    };
+  } catch (err) {
+    console.error("verifyEmailViaProvider エラー:", err.message);
+    return { valid: false, status: "error", reason: err.message };
+  }
+}
+
+// ══════════════════════════════════════════════
+// 単一メアド検証 — VERIFY_PROVIDER で切替
 // POST /email/verify-single  { email: string }
 // ══════════════════════════════════════════════
 app.post("/email/verify-single", async (req, res) => {
@@ -327,54 +404,14 @@ app.post("/email/verify-single", async (req, res) => {
     return res.status(400).json({ error: "email が必要です" });
   }
 
-  const verifyKey = process.env.VERIFY_API_KEY || CONFIG.EMAILVERIFY_API_KEY || "";
+  const result = await verifyEmailViaProvider(email);
+  console.log(`✓ verify-single [${process.env.VERIFY_PROVIDER || "millionverifier"}]: ${email} → ${result.status} (valid=${result.valid})`);
 
-  // VERIFY_API_KEY 未設定の場合はモックで valid を返す
-  if (!verifyKey) {
-    console.warn(`⚠️  VERIFY_API_KEY 未設定 — ${email} をモック検証 (valid)`);
-    return res.json({
-      email,
-      valid: true,
-      status: "valid",
-      reason: "mock_no_api_key",
-      mock: true,
-    });
+  if (result.mock) {
+    console.warn(`⚠️  VERIFY_API_KEY 未設定 — ${email} は検証されず unknown 扱い`);
   }
 
-  try {
-    // MillionVerifier API 呼び出し
-    const url = `https://api.millionverifier.com/api/v3/?api=${encodeURIComponent(verifyKey)}&email=${encodeURIComponent(email)}&timeout=10`;
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error(`MillionVerifier HTTP ${response.status}:`, errText.slice(0, 200));
-      // API エラー時は保守的に invalid を返さず unknown 扱い
-      return res.json({ email, valid: false, status: "unknown", reason: `api_error_${response.status}` });
-    }
-
-    const data = await response.json();
-    // MillionVerifier レスポンス: { result: "ok"|"unknown"|"error", resultcode: number, ... }
-    const rawResult = String(data.result || data.status || "unknown").toLowerCase().trim();
-    const isValid = rawResult === "ok" || rawResult === "valid" || rawResult === "deliverable";
-
-    console.log(`✓ verify-single: ${email} → ${rawResult} (valid=${isValid})`);
-
-    res.json({
-      email,
-      valid: isValid,
-      status: rawResult,
-      reason: isValid ? "valid" :
-              rawResult === "unknown" || rawResult === "unknown_email" ? "unknown" :
-              rawResult === "catch_all" ? "catch_all" :
-              rawResult === "disposable" ? "disposable" :
-              "invalid",
-      raw: data,
-    });
-  } catch (err) {
-    console.error("verify-single エラー:", err.message);
-    res.status(500).json({ email, valid: false, status: "error", reason: err.message });
-  }
+  res.json({ email, ...result });
 });
 
 app.post("/email/verify-emailverify", async (req, res) => {
@@ -769,6 +806,13 @@ async function runVerifyWorker(supaUrl, supaKey) {
   verifyWorkerRunning = true;
 
   const verifyKey = process.env.VERIFY_API_KEY || CONFIG.EMAILVERIFY_API_KEY || "";
+  const provider = (process.env.VERIFY_PROVIDER || "millionverifier").toLowerCase().trim();
+
+  if (!verifyKey) {
+    console.warn(`⚠️  VERIFY_API_KEY 未設定 — 検証ワーカーをスキップ。レコードは unverified のまま留まります`);
+    verifyWorkerRunning = false;
+    return;
+  }
 
   try {
     // unverified かつ email ありのレコードを取得
@@ -779,34 +823,31 @@ async function runVerifyWorker(supaUrl, supaKey) {
     if (!res.ok) throw new Error(`Supabase取得エラー: ${res.status}`);
     const targets = await res.json();
 
-    console.log(`🔍 検証対象: ${targets.length}件`);
+    console.log(`🔍 検証ワーカー開始 [${provider}]: ${targets.length}件`);
+
+    let validCount = 0, invalidCount = 0, errorCount = 0;
 
     for (let i = 0; i < targets.length; i++) {
       const { id, email } = targets[i];
-      let newStatus = "invalid";
 
-      try {
-        if (!verifyKey) {
-          // モック: APIキー未設定時は全件validとして扱う
-          newStatus = "ready";
-        } else {
-          const vRes = await fetch(
-            `https://api.millionverifier.com/api/v3/?api=${encodeURIComponent(verifyKey)}&email=${encodeURIComponent(email)}&timeout=10`,
-            { signal: AbortSignal.timeout(15000) }
-          );
-          if (vRes.ok) {
-            const vData = await vRes.json();
-            const raw = String(vData.result || vData.status || "unknown").toLowerCase().trim();
-            newStatus = (raw === "ok" || raw === "valid" || raw === "deliverable") ? "ready" : "invalid";
-          }
-        }
-      } catch (err) {
-        console.warn(`検証エラー (${email}):`, err.message);
+      const result = await verifyEmailViaProvider(email);
+      // valid → ready / invalid 系 → invalid / unknown 系 → unverified のまま留める
+      let newStatus;
+      if (result.valid) {
+        newStatus = "ready";
+        validCount++;
+      } else if (result.status === "unknown" || result.status === "error") {
+        // 不確定なら unverified を維持して次回再試行可能に
+        errorCount++;
+        await new Promise(r => setTimeout(r, 150));
+        continue;
+      } else {
         newStatus = "invalid";
+        invalidCount++;
       }
 
       // Supabaseを更新
-      await fetch(`${supaUrl}/rest/v1/crm_contacts?id=eq.${id}`, {
+      const patchRes = await fetch(`${supaUrl}/rest/v1/crm_contacts?id=eq.${id}`, {
         method: "PATCH",
         headers: {
           apikey: supaKey,
@@ -816,22 +857,38 @@ async function runVerifyWorker(supaUrl, supaKey) {
         },
         body: JSON.stringify({ status: newStatus, updated_at: new Date().toISOString() }),
       });
+      if (!patchRes.ok) {
+        console.warn(`Supabase PATCH 失敗 (${id}): ${patchRes.status}`);
+      }
 
       if ((i + 1) % 10 === 0) {
-        console.log(`🔍 検証進捗: ${i + 1}/${targets.length}件`);
+        console.log(`🔍 検証進捗: ${i + 1}/${targets.length}件 (ready=${validCount}, invalid=${invalidCount}, skipped=${errorCount})`);
       }
 
       // レート制限対策: 150ms待機
       await new Promise(r => setTimeout(r, 150));
     }
 
-    console.log(`✅ 検証ワーカー完了: ${targets.length}件処理`);
+    console.log(`✅ 検証ワーカー完了: ${targets.length}件中 ready=${validCount}, invalid=${invalidCount}, skipped=${errorCount}`);
   } catch (err) {
     console.error("検証ワーカー失敗:", err.message);
   } finally {
     verifyWorkerRunning = false;
   }
 }
+
+// ── 検証ワーカーを手動トリガーするエンドポイント ──
+//   CSV インポートで Supabase に直接書き込んだ後、ワーカー起動を促す用
+app.post("/webhook/verify-trigger", async (req, res) => {
+  const supaUrl = CONFIG.DOLLARBIZ_SUPABASE_URL;
+  const supaKey = CONFIG.DOLLARBIZ_SUPABASE_KEY;
+  if (verifyWorkerRunning) {
+    return res.json({ started: false, reason: "already_running" });
+  }
+  // バックグラウンド実行（即レスポンス）
+  runVerifyWorker(supaUrl, supaKey).catch(err => console.error("verify-trigger error:", err));
+  res.json({ started: true });
+});
 
 // ── 検証ワーカーの状態確認エンドポイント ──
 app.get("/webhook/verify-status", async (req, res) => {
@@ -2829,6 +2886,144 @@ app.get("/linkedin/status", (_req, res) => {
     baseUrl:   configured ? CONFIG.UNIPILE_URL : null,
     hint: configured ? null : "Railway の環境変数に UNIPILE_API_KEY と UNIPILE_ACCOUNT_ID を設定してください。",
   });
+});
+
+// ══════════════════════════════════════════════════════════════
+// POST /search/find-x-accounts-batch
+//   body: { targets: [{ id, name, company, title }] }
+//   response: { matches: [{ id, matchUrl }] }
+//
+//   処理フロー:
+//     1. targets を5件ずつのチャンクに分割
+//     2. 各チャンクをOR条件で Brave Search (site:x.com)
+//     3. 結果スニペットを Gemini 2.5 Flash に渡して同一人物判定
+//     4. 確証のあるものだけを返す（誤爆ゼロ優先）
+// ══════════════════════════════════════════════════════════════
+app.post("/search/find-x-accounts-batch", async (req, res) => {
+  if (!BRAVE_API_KEY) {
+    return res.status(503).json({ error: "BRAVE_API_KEY が未設定です。" });
+  }
+  const geminiKey = CONFIG.GEMINI_API_KEY;
+  if (!geminiKey) {
+    return res.status(503).json({ error: "GEMINI_API_KEY が未設定です。" });
+  }
+
+  const { targets } = req.body;
+  if (!Array.isArray(targets) || targets.length === 0) {
+    return res.status(400).json({ error: "targets 配列が必要です" });
+  }
+
+  const CHUNK_SIZE = 5;
+  const allMatches = [];
+
+  try {
+    for (let i = 0; i < targets.length; i += CHUNK_SIZE) {
+      const chunk = targets.slice(i, i + CHUNK_SIZE);
+
+      // ── Stage 1: Brave Search でOR検索 ──
+      const namesPart = chunk.map(t => `"${t.name}"`).join(" OR ");
+      const query = `site:x.com (${namesPart})`;
+      const braveUrl = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=15`;
+
+      console.log(`🎯 X特定バッチ [${i}..${i + chunk.length - 1}]: ${query}`);
+
+      let searchResults = [];
+      try {
+        const braveRes = await fetch(braveUrl, {
+          method: "GET",
+          headers: {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": BRAVE_API_KEY,
+          },
+        });
+        if (braveRes.ok) {
+          const braveData = await braveRes.json();
+          searchResults = (braveData.web?.results || []).map(r => ({
+            title: r.title || "",
+            url:   r.url   || "",
+            snippet: r.description || "",
+          }));
+        } else {
+          console.warn(`Brave API ${braveRes.status}:`, await braveRes.text().then(t => t.slice(0, 200)));
+        }
+      } catch (braveErr) {
+        console.warn("Brave 検索エラー:", braveErr.message);
+      }
+
+      if (searchResults.length === 0) continue;
+
+      // ── Stage 2: Gemini で同一人物判定 ──
+      const targetLines = chunk.map(t =>
+        `- id="${t.id}" 名前="${t.name}" 会社="${t.company || "?"}" 役職="${t.title || "?"}"`
+      ).join("\n");
+
+      const resultLines = searchResults.map((r, idx) =>
+        `[${idx}] URL: ${r.url}\nタイトル: ${r.title}\nスニペット: ${r.snippet}`
+      ).join("\n\n");
+
+      const prompt = `以下の【ターゲットリスト】と【X（Twitter）の検索結果スニペット】を比較してください。
+検索結果のプロフィール文（スニペット）に会社名や役職が含まれており、確実にターゲットと同一人物だと断定できるXアカウントのURLのみをマッピングしてください。
+確証がない別人のアカウントは絶対に含めないでください。
+純粋なJSONで以下の形式の配列のみを返してください（Markdown不要）:
+[{ "id": "ターゲットのid", "matchUrl": "https://x.com/..." }]
+
+【ターゲットリスト】
+${targetLines}
+
+【X（Twitter）の検索結果スニペット】
+${resultLines}`;
+
+      const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`;
+
+      try {
+        const geminiRes = await fetch(GEMINI_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              maxOutputTokens: 512,
+              temperature: 0.1,
+              responseMimeType: "application/json",
+            },
+          }),
+        });
+
+        if (geminiRes.ok) {
+          const geminiData = await geminiRes.json();
+          let rawText = (geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+          rawText = rawText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+          const jsonMatch = rawText.match(/\[[\s\S]*\]/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            if (Array.isArray(parsed)) {
+              parsed.forEach(item => {
+                if (item.id && item.matchUrl && item.matchUrl.includes("x.com")) {
+                  allMatches.push({ id: item.id, matchUrl: item.matchUrl });
+                }
+              });
+            }
+          }
+        } else {
+          console.warn(`Gemini API ${geminiRes.status} (find-x-accounts-batch chunk ${i})`);
+        }
+      } catch (geminiErr) {
+        console.warn("Gemini 判定エラー:", geminiErr.message);
+      }
+
+      // Brave API レート制限対策（チャンク間に少し待機）
+      if (i + CHUNK_SIZE < targets.length) {
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+
+    console.log(`🎯 X特定完了: ${targets.length}件 → ${allMatches.length}件マッチ`);
+    res.json({ matches: allMatches });
+  } catch (err) {
+    console.error("find-x-accounts-batch エラー:", err.message);
+    res.status(500).json({ error: err.message, matches: allMatches });
+  }
 });
 
 // ══════════════════════════════════════════════
