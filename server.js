@@ -1970,6 +1970,78 @@ const BRAVE_API_KEY = process.env.BRAVE_API_KEY || "BSAa57ptg3zN_mpPrzv-C3IW1Vlt
 // ── X-Ray 検索クエリのパターン ──
 const LINKEDIN_SITE_QUERY = "site:linkedin.com/in";
 
+// ── SMTP 検証ヘルパー ──
+const dns = require('dns').promises;
+const net = require('net');
+
+const SMTP_HELO = process.env.SMTP_HELO_DOMAIN || 'verifier.invalid';
+const SMTP_FROM = process.env.SMTP_MAIL_FROM   || `probe@${SMTP_HELO}`;
+
+function smtpSession(host, recipients) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port: 25 });
+    socket.setEncoding('utf8');
+    socket.setTimeout(12000);
+    const results = recipients.map(r => ({ rcpt: r, code: null, message: '' }));
+    let buf = '', phase = 'greet', idx = 0;
+    const send = l => socket.write(l + '\r\n');
+    const finish = reason => { try { socket.destroy(); } catch (_) {} resolve({ results, reason }); };
+    socket.on('timeout', () => finish('timeout'));
+    socket.on('error',   e  => finish(e.code || 'error'));
+    socket.on('close',   ()  => finish('closed'));
+    socket.on('data', chunk => {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const raw = buf.slice(0, nl).replace(/\r$/, ''); buf = buf.slice(nl + 1);
+        if (!raw || /^\d{3}-/.test(raw)) continue;
+        const code = parseInt(raw.slice(0, 3), 10), msg = raw.slice(4);
+        switch (phase) {
+          case 'greet': if (code !== 220) { finish(`bad_greet_${code}`); return; } phase = 'ehlo'; send(`EHLO ${SMTP_HELO}`); break;
+          case 'ehlo':  if (code !== 250) { phase = 'helo'; send(`HELO ${SMTP_HELO}`); break; } phase = 'mail'; send(`MAIL FROM:<${SMTP_FROM}>`); break;
+          case 'helo':  if (code !== 250) { finish(`helo_failed_${code}`); return; } phase = 'mail'; send(`MAIL FROM:<${SMTP_FROM}>`); break;
+          case 'mail':  if (code !== 250) { finish(`mail_from_failed_${code}`); return; } phase = 'rcpt'; send(`RCPT TO:<${recipients[idx]}>`); break;
+          case 'rcpt':
+            results[idx].code = code; results[idx].message = msg; idx++;
+            if (idx < recipients.length) { send(`RCPT TO:<${recipients[idx]}>`); }
+            else { phase = 'quit'; send('QUIT'); }
+            break;
+          case 'quit': finish('done'); break;
+        }
+      }
+    });
+  });
+}
+
+function smtpClassifyProvider(mxHost) {
+  const h = (mxHost || '').toLowerCase();
+  if (h.endsWith('.protection.outlook.com')) return 'microsoft365';
+  if (h.endsWith('.google.com') || h.includes('googlemail')) return 'google';
+  if (h.includes('mimecast') || h.includes('proofpoint') || h.includes('barracuda')) return 'security_gateway';
+  return 'self_hosted';
+}
+
+async function smtpVerifyBatch(domain, candidateEmails) {
+  let mx;
+  try { mx = (await dns.resolveMx(domain)).sort((a, b) => a.priority - b.priority); }
+  catch { return { domain, provider: 'no_mx', results: candidateEmails.map(e => ({ email: e, status: 'unknown', reason: 'no_mx' })) }; }
+  const mxHost = mx[0].exchange;
+  const provider = smtpClassifyProvider(mxHost);
+  if (provider !== 'self_hosted') {
+    return { domain, mxHost, provider, results: candidateEmails.map(e => ({ email: e, status: 'unverifiable', reason: `provider_${provider}` })) };
+  }
+  const probe = `xq8z9k${Date.now().toString(36)}-noexist@${domain}`;
+  const session = await smtpSession(mxHost, [probe, ...candidateEmails]);
+  const isCatchAll = session.results[0]?.code >= 200 && session.results[0]?.code < 300;
+  const results = session.results.slice(1).map(r => {
+    if (r.code === null) return { email: r.rcpt, status: 'unknown', reason: session.reason };
+    if (r.code >= 200 && r.code < 300) return { email: r.rcpt, status: isCatchAll ? 'catch_all' : 'valid', code: r.code };
+    if (r.code >= 400 && r.code < 500) return { email: r.rcpt, status: 'risky', code: r.code };
+    return { email: r.rcpt, status: 'invalid', code: r.code, reason: r.message };
+  });
+  return { domain, mxHost, provider, isCatchAll, results };
+}
+
 // 推測メアドパターン生成
 // 入力: firstName="Taro", lastName="Yamada", domain="example.com"
 // 出力: ["taro@example.com", "yamada.taro@example.com", ...]
@@ -2472,8 +2544,6 @@ ${lines}
 //     3. valid なものを返す
 // ══════════════════════════════════════════════════════════════
 app.post("/email/guess-and-verify", async (req, res) => {
-  const evKey = CONFIG.EMAILVERIFY_API_KEY || process.env.EMAILVERIFY_API_KEY;
-
   let { firstName, lastName, domain, name, candidateId } = req.body;
 
   // "name" として姓名まとめて渡された場合は分割
@@ -2558,51 +2628,19 @@ JSON のみ返してください（説明文不要）:
     return res.status(400).json({ error: "メアドパターンを生成できませんでした。氏名とドメインを確認してください。" });
   }
 
-  // EmailVerify.io が未設定の場合はパターン生成のみ返す
-  if (!evKey) {
-    return res.json({
-      candidateId,
-      guesses,
-      verifiedEmail: null,
-      allResults:    guesses.map(e => ({ email: e, valid: false, status: "unverified", reason: "no_api_key" })),
-      note:          "EMAILVERIFY_API_KEY 未設定のためパターン生成のみ。検証なしでCRMに追加することもできます。",
-    });
-  }
+  // SMTP プローブで検証
+  const smtpResult = await smtpVerifyBatch(domain, guesses).catch(e => ({
+    domain, provider: 'error', results: guesses.map(email => ({ email, status: 'unknown', reason: e.message }))
+  }));
 
-  // EmailVerify.io で順次検証。valid が見つかった時点で停止（クレジット節約）
-  const allResults = [];
-  let verifiedEmail = null;
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-  for (let i = 0; i < guesses.length; i++) {
-    const email = guesses[i];
-    try {
-      const url = `https://app.emailverify.io/api/v1/validate/?key=${encodeURIComponent(evKey)}&email=${encodeURIComponent(email)}`;
-      const r = await fetch(url);
-      if (!r.ok) {
-        allResults.push({ email, valid: false, status: "error", reason: `api_${r.status}` });
-        continue;
-      }
-      const d = await r.json();
-      // ★ EmailVerify.io はレスポンス形式が不安定なため複数フィールドを確認
-      const rawStatus = String(
-        d.status || d.result || d.verdict || d.email_status ||
-        d.response?.status || d.data?.status || "unknown"
-      ).toLowerCase().trim();
-      const isValid = rawStatus === "valid" || rawStatus === "deliverable" || rawStatus === "ok" || rawStatus === "true";
-      allResults.push({ email, valid: isValid, status: rawStatus, raw: d });
-
-      if (isValid) {
-        verifiedEmail = email;
-        console.log(`✓ メアド特定: ${email}`);
-        break; // 最初の valid で終了
-      }
-    } catch (e) {
-      allResults.push({ email, valid: false, status: "error", reason: e.message });
-    }
-    // レートリミット対策 (最後は不要)
-    if (i < guesses.length - 1) await sleep(150);
-  }
+  const allResults = smtpResult.results.map(r => ({
+    email:  r.email,
+    valid:  r.status === 'valid',
+    status: r.status,
+    reason: r.reason || null,
+    code:   r.code   || null,
+  }));
+  const verifiedEmail = allResults.find(r => r.valid)?.email || null;
 
   console.log(`📧 guess-and-verify: ${firstName} ${lastName} @ ${domain} → ${verifiedEmail || "not found"} (${allResults.length}パターン試行)`);
 
