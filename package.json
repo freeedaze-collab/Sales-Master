@@ -14,8 +14,8 @@
   "dependencies": {
     "@aws-sdk/client-ses": "^3.1033.0",
     "cors": "^2.8.6",
-    "dotenv": "^17.3.1",
-    "express": "^5.2.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
     "googleapis": "^171.4.0",
     "node-fetch": "^2.7.0",
     "nodemailer": "^8.0.4",
