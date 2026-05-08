@@ -2142,20 +2142,30 @@ function parseLinkedInCandidate(item) {
     if (/^(Former|Ex-|Past|Previous)/i.test(title)) title = "";
   }
 
+  // 役職キーワード（これだけのときは会社名ではない）
+  const JOB_TITLE_RE = /^(CEO|CFO|CTO|COO|CMO|CPO|CRO|CDO|CISO|CSO|CLO|MD|VP|SVP|EVP|GM|Director|Manager|Head|Chief|Founder|Co-Founder|President|Owner|Partner|Principal|Consultant|Advisor|Engineer|Developer|Designer|Analyst|Associate|Specialist|Lead|Senior|Junior|Intern)/i;
+
   // --- 会社名の抽出（現職のみ） ---
   let company = "";
-  // "Name - Company | LinkedIn" 形式（Brave SearchのLinkedInタイトル）
-  const dashMatch = rawTitle.match(/^.+?\s+-\s+(.+?)\s*(?:\||·|$)/);
-  if (dashMatch) {
-    company = dashMatch[1].replace(/\bLinkedIn\b/i, "").trim();
-  }
-  // スニペットの "at Company" 形式（補完）
+
+  // 1. スニペット・タイトルの "at Company" 形式を最優先（ファクトベース）
+  const atMatch =
+    currentSnippet.match(/(?:^|\s)(?:at|@)\s+([A-Za-z0-9][A-Za-z0-9\s\.,&\-']{1,50?})(?:\s*[·|\n·]|$)/i) ||
+    rawTitle.match(/\bat\s+([A-Za-z0-9][A-Za-z0-9\s\.,&\-']{1,50?})(?:\s*[·|\-|\|]|$)/i);
+  if (atMatch) company = atMatch[1].trim();
+
+  // 2. "Name - X | LinkedIn" の X が役職でなければ会社名
   if (!company) {
-    const atMatch =
-      currentSnippet.match(/(?:at|@)\s+([A-Za-z0-9\s\.,&\-']{2,50?}?)(?:\s*[·|\n]|$)/i) ||
-      rawTitle.match(/(?:at|@)\s+([A-Za-z0-9\s\.,&\-']{2,50?}?)(?:\s*[·|\-|\|]|$)/i);
-    if (atMatch) company = atMatch[1].trim();
+    const dashMatch = rawTitle.match(/^.+?\s+-\s+(.+?)\s*(?:\||·|$)/);
+    if (dashMatch) {
+      const candidate = dashMatch[1].replace(/\bLinkedIn\b/i, "").trim();
+      // 役職キーワードだけ or "at"を含む場合はスキップ（atMatchで拾うべき）
+      if (candidate && !JOB_TITLE_RE.test(candidate) && !candidate.toLowerCase().includes(" at ")) {
+        company = candidate;
+      }
+    }
   }
+
   company = company.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, "").trim();
 
   // --- ドメイン推測 ---
