@@ -2529,18 +2529,31 @@ ${lines}
     let rawText = (geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
     rawText = rawText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
 
-    const domainMap = {};
+    const rawDomainMap = {};
     const jsonMatch = rawText.match(/\[[\s\S]*\]/);
     if (jsonMatch) {
       const arr = JSON.parse(jsonMatch[0]);
       arr.forEach(item => {
         if (typeof item.index === "number" && item.domain && candidateList[item.index]) {
-          domainMap[candidateList[item.index].id] = item.domain;
+          rawDomainMap[candidateList[item.index].id] = item.domain;
         }
       });
     }
 
-    console.log(`🌐 guess-domains: ${candidateList.length}件 → ${Object.keys(domainMap).length}件推測成功`);
+    // DNS 解決確認: 実在しないドメインを除外
+    const domainMap = {};
+    await Promise.all(
+      Object.entries(rawDomainMap).map(async ([id, domain]) => {
+        try {
+          await dns.resolve(domain);
+          domainMap[id] = domain;
+        } catch {
+          console.log(`⚠️ guess-domains: ${domain} はDNS未解決 → スキップ`);
+        }
+      })
+    );
+
+    console.log(`🌐 guess-domains: ${candidateList.length}件 → ${Object.keys(rawDomainMap).length}件推測 → ${Object.keys(domainMap).length}件DNS確認済`);
     res.json({ domainMap });
   } catch (err) {
     console.error("guess-domains エラー:", err.message);
@@ -2655,14 +2668,24 @@ JSON のみ返してください（説明文不要）:
     reason: r.reason || null,
     code:   r.code   || null,
   }));
+  const provider = smtpResult.provider || 'unknown';
   const verifiedEmail = allResults.find(r => r.valid)?.email || null;
 
-  console.log(`📧 guess-and-verify: ${firstName} ${lastName} @ ${domain} → ${verifiedEmail || "not found"} (${allResults.length}パターン試行)`);
+  // Google/Microsoft365 はSMTP検証不可 → 最有力パターンをbestGuessとして返す
+  // パターン優先順: firstname.lastname@ → flastname@ → firstname@
+  let bestGuess = null;
+  if (!verifiedEmail && (provider === 'google' || provider === 'microsoft365')) {
+    bestGuess = guesses[0] || null;
+  }
+
+  console.log(`📧 guess-and-verify: ${firstName} ${lastName} @ ${domain} [${provider}] → ${verifiedEmail || bestGuess || "not found"} (${allResults.length}パターン試行)`);
 
   res.json({
     candidateId,
     guesses,
     verifiedEmail,
+    bestGuess,
+    provider,
     allResults,
   });
 });

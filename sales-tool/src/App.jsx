@@ -1592,6 +1592,9 @@ function IntentSearchTab({ settings, crm, setCrm, prefill }) {
       if (data.verifiedEmail) {
         setCandidates(prev => prev.map(c => c.id === candidate.id ? { ...c, email: data.verifiedEmail, _verifyStatus: "valid" } : c));
         return data.verifiedEmail;
+      } else if (data.bestGuess) {
+        setCandidates(prev => prev.map(c => c.id === candidate.id ? { ...c, email: data.bestGuess, _verifyStatus: "unverifiable" } : c));
+        return data.bestGuess;
       }
       return null;
     } catch (e) {
@@ -2393,8 +2396,10 @@ function IntentSearchTab({ settings, crm, setCrm, prefill }) {
                             {gs.result && !hasEmail && (
                               <div style={{ marginTop: 6, padding: "6px 10px", background: "var(--color-background-secondary)", borderRadius: 6, fontSize: 11, color: "var(--color-text-secondary)" }}>
                                 {gs.result.verifiedEmail
-                                  ? <span style={{ color: "#1D9E75", fontWeight: 500 }}>✓ {gs.result.verifiedEmail} (valid)</span>
-                                  : <span>有効なメアドが見つかりませんでした ({gs.result.allResults.length}パターン試行)</span>}
+                                  ? <span style={{ color: "#1D9E75", fontWeight: 500 }}>✓ {gs.result.verifiedEmail} (SMTP検証済)</span>
+                                  : gs.result.bestGuess
+                                  ? <span style={{ color: "#E89820", fontWeight: 500 }}>? {gs.result.bestGuess} (推測のみ・{gs.result.provider}は検証不可)</span>
+                                  : <span>有効なメアドが見つかりませんでした ({gs.result.allResults?.length || 0}パターン試行)</span>}
                                 {gs.result.note && <span style={{ marginLeft: 6, fontSize: 10, color: "var(--color-text-tertiary)" }}>({gs.result.note})</span>}
                               </div>
                             )}
