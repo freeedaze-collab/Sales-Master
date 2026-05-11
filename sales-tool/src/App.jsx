@@ -2903,59 +2903,110 @@ function ListTab({ crm, setCrm }) {
   }, [crm]);  // crm を依存に入れて重複判定を最新にする (processCsvFile は同 crm closure を共有)
 
   // ────────────────────────────────────────────
-  // 一括クリーニング（未検証リードを検証API呼び出し）
+  // 一括クリーニング
+  //   メアドあり → SMTP検証
+  //   メアドなし → ドメイン推測 → メアド推測 → SMTP検証
   // ────────────────────────────────────────────
   const handleBulkClean = async () => {
-    const unverified = crm.filter(c => (c.status === "unverified" || c.status === "未送信") && c.email);
-    if (unverified.length === 0) {
-      alert("メールアドレスがあるリードがありません");
+    const targets = crm.filter(c => c.status === "unverified" || c.status === "未送信");
+    if (targets.length === 0) {
+      alert("未検証・未送信のリードがありません");
       return;
     }
-    if (!window.confirm(`${unverified.length}件のメールアドレスを検証します。時間がかかる場合があります。続行しますか？`)) return;
+    const withEmail = targets.filter(c => c.email);
+    const noEmail   = targets.filter(c => !c.email);
+    if (!window.confirm(`${targets.length}件を処理します（メアド検証: ${withEmail.length}件、メアド推測: ${noEmail.length}件）。続行しますか？`)) return;
 
     setCleaning(true);
-    setCleanProgress({ done: 0, total: unverified.length, valid: 0, invalid: 0 });
+    const total = targets.length;
+    setCleanProgress({ done: 0, total, valid: 0, invalid: 0 });
+    let valid = 0, invalid = 0, done = 0;
 
-    let valid = 0, invalid = 0;
+    // ── Phase 1: メアドなし → ドメイン推測 → guess-and-verify ──
+    if (noEmail.length > 0) {
+      // ドメインがない分をまとめてGeminiに投げる
+      const needDomain = noEmail.filter(c => !(c.domain || c.guessedDomain));
+      let domainMap = {};
+      if (needDomain.length > 0) {
+        try {
+          const r = await fetch(`${RAILWAY}/search/guess-domains`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              candidates: needDomain.map(c => ({
+                id: c.id, name: c.name,
+                title: c.title || "", company: c.company || "",
+                linkedinUrl: c.linkedin || c.linkedinUrl || "",
+                rawTitle: (c.rawTitle || "").slice(0, 150),
+                rawSnippet: (c.rawSnippet || "").slice(0, 120),
+              })),
+            }),
+          });
+          if (r.ok) {
+            const d = await r.json();
+            domainMap = d.domainMap || {};
+            setCrm(prev => prev.map(c => domainMap[c.id] ? { ...c, guessedDomain: domainMap[c.id] } : c));
+          }
+        } catch (e) { console.warn("ドメイン推測エラー:", e.message); }
+      }
 
-    for (let i = 0; i < unverified.length; i++) {
-      const contact = unverified[i];
+      for (let i = 0; i < noEmail.length; i++) {
+        const contact = noEmail[i];
+        const domain = domainMap[contact.id] || contact.domain || contact.guessedDomain || "";
+        if (!domain) {
+          invalid++;
+          done++;
+          setCleanProgress({ done, total, valid, invalid });
+          continue;
+        }
+        const nameParts = (contact.name || "").trim().split(/\s+/);
+        const firstName = nameParts[0] || "";
+        const lastName  = nameParts.slice(1).join(" ") || nameParts[0] || "";
+        try {
+          const r = await fetch(`${RAILWAY}/email/guess-and-verify`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ firstName, lastName, domain, name: contact.name, candidateId: contact.id }),
+          });
+          if (r.ok) {
+            const d = await r.json();
+            const email = d.verifiedEmail || d.bestGuess || null;
+            if (email) {
+              valid++;
+              const newStatus = d.verifiedEmail ? "ready" : "unverified";
+              setCrm(prev => prev.map(c => c.id === contact.id ? { ...c, email, status: newStatus } : c));
+            } else {
+              invalid++;
+            }
+          } else { invalid++; }
+        } catch (e) { console.warn("guess-and-verify エラー:", contact.name, e.message); invalid++; }
+        done++;
+        setCleanProgress({ done, total, valid, invalid });
+        if (i < noEmail.length - 1) await new Promise(r => setTimeout(r, 200));
+      }
+    }
+
+    // ── Phase 2: メアドあり → SMTP検証 ──
+    for (let i = 0; i < withEmail.length; i++) {
+      const contact = withEmail[i];
       let newStatus = "invalid";
-
       try {
-        const res = await fetch(`${RAILWAY}/email/verify-single`, {
+        const r = await fetch(`${RAILWAY}/email/verify-single`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email: contact.email }),
         });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.unverifiable) {
-            // Google/Microsoft は SMTP検証不可 → unverified のまま維持
-            newStatus = "unverified";
-          } else {
-            newStatus = data.valid ? "ready" : "invalid";
-          }
+        if (r.ok) {
+          const d = await r.json();
+          newStatus = d.unverifiable ? "unverified" : (d.valid ? "ready" : "invalid");
         }
-      } catch (err) {
-        console.warn("verify-single エラー:", contact.email, err.message);
-        newStatus = "invalid";
-      }
-
+      } catch (e) { console.warn("verify-single エラー:", contact.email, e.message); }
       if (newStatus === "ready") valid++;
       else invalid++;
-
-      // インメモリ CRM を1件ずつ更新（setCrmWithSync を使って Supabase にも同期）
-      setCrm(prev => prev.map(c =>
-        c.id === contact.id ? { ...c, status: newStatus } : c
-      ));
-
-      setCleanProgress({ done: i + 1, total: unverified.length, valid, invalid });
-
-      // レート制限対策: 1件ごとに150ms待機
-      if (i < unverified.length - 1) {
-        await new Promise(r => setTimeout(r, 150));
-      }
+      setCrm(prev => prev.map(c => c.id === contact.id ? { ...c, status: newStatus } : c));
+      done++;
+      setCleanProgress({ done, total, valid, invalid });
+      if (i < withEmail.length - 1) await new Promise(r => setTimeout(r, 150));
     }
 
     setCleaning(false);
@@ -2977,7 +3028,7 @@ function ListTab({ crm, setCrm }) {
     setShowAddForm(false);
   };
 
-  const unverifiedCount = crm.filter(c => (c.status === "unverified" || c.status === "未送信") && c.email).length;
+  const unverifiedCount = crm.filter(c => c.status === "unverified" || c.status === "未送信").length;
 
   const statusFilters = FILTER_OPTIONS.filter(f => f.type === "all" || f.type === "status");
   const gaFilters     = FILTER_OPTIONS.filter(f => f.type === "flag" || f.type === "ga" || f.type === "plan");
