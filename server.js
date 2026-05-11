@@ -3195,6 +3195,63 @@ const PORT = process.env.PORT || 3001;
     }
   }
 
+// ══════════════════════════════════════════════════════════════
+// CRM proxy — service_role キーで RLS バイパス
+// ══════════════════════════════════════════════════════════════
+function getCrmSupabase() {
+  const url = CONFIG.DOLLARBIZ_SUPABASE_URL;
+  const key = CONFIG.DOLLARBIZ_SUPABASE_KEY;
+  if (!url || !key) return null;
+  const headers = { "Content-Type": "application/json", "apikey": key, "Authorization": `Bearer ${key}` };
+  return { url, headers };
+}
+
+app.get("/crm/contacts", async (_req, res) => {
+  const sb = getCrmSupabase();
+  if (!sb) return res.status(503).json({ error: "Supabase未設定" });
+  try {
+    const r = await fetch(`${sb.url}/rest/v1/crm_contacts?select=*&order=added_at.asc`, { headers: sb.headers });
+    if (!r.ok) throw new Error(`Supabase ${r.status}: ${await r.text()}`);
+    res.json(await r.json());
+  } catch (e) {
+    console.error("GET /crm/contacts エラー:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/crm/contacts", async (req, res) => {
+  const sb = getCrmSupabase();
+  if (!sb) return res.status(503).json({ error: "Supabase未設定" });
+  try {
+    const r = await fetch(`${sb.url}/rest/v1/crm_contacts`, {
+      method: "POST",
+      headers: { ...sb.headers, "Prefer": "resolution=merge-duplicates" },
+      body: JSON.stringify(req.body),
+    });
+    if (!r.ok) throw new Error(`Supabase ${r.status}: ${await r.text()}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /crm/contacts エラー:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/crm/contacts/:id", async (req, res) => {
+  const sb = getCrmSupabase();
+  if (!sb) return res.status(503).json({ error: "Supabase未設定" });
+  try {
+    const r = await fetch(`${sb.url}/rest/v1/crm_contacts?id=eq.${req.params.id}`, {
+      method: "DELETE",
+      headers: sb.headers,
+    });
+    if (!r.ok) throw new Error(`Supabase ${r.status}: ${await r.text()}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("DELETE /crm/contacts エラー:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
   app.listen(PORT, async () => {
     console.log(`Sales Automation バックエンド v2 起動: http://localhost:${PORT}`);
     console.log(`モード: 多次元実験 + 学習ループ + 不達対策`);

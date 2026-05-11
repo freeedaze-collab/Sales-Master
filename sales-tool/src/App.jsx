@@ -6044,23 +6044,65 @@ export default function App() {
   useEffect(() => { sendPageView(TAB_PATHS[0], TABS[0]); }, []); // eslint-disable-line
 
   useEffect(() => {
+    setDbLoading(true);
+
+    // 1. バックエンド経由でCRM取得（service_role キー → RLS バイパス）
+    const loadViaBackend = fetch(`${RAILWAY}/crm/contacts`)
+      .then(async r => {
+        if (!r.ok) throw new Error(`backend ${r.status}`);
+        const rows = await r.json();
+        if (Array.isArray(rows) && rows.length > 0) {
+          // DB カラム → アプリ内フィールド名にマッピング
+          const contacts = rows.map(c => ({
+            id:          c.id,
+            name:        c.name        || "",
+            title:       c.title       || "",
+            company:     c.company     || "",
+            industry:    c.industry    || "",
+            email:       c.email       || "",
+            linkedin:    c.linkedin    || "",
+            linkedinUrl: c.linkedin    || "",
+            country:     c.country     || "",
+            status:      c.status      || "未送信",
+            score:       c.score       || 0,
+            clicked:     c.clicked     || false,
+            opens:       c.opens       || 0,
+            gaData:      c.ga_data     || null,
+            notes:       c.notes       || "",
+            subject:     c.subject     || "",
+            messageBody: c.message_body || "",
+            trackingId:  c.tracking_id || null,
+            sentAt:      c.sent_at     || null,
+            addedAt:     c.added_at    || null,
+            campaignId:  null,
+            variantId:   null,
+            clicks:      0,
+          }));
+          setCrm(contacts);
+          setDbStatus({ ok: true });
+          return true;
+        }
+        return false;
+      })
+      .catch(e => {
+        console.warn("バックエンドCRM取得失敗:", e.message);
+        return false;
+      });
+
+    // 2. Settings は独立してロード（失敗してもCRMに影響しない）
     const url = settings.supabaseUrl;
     const key = settings.supabaseKey;
-    if (!url || !key) return;
-    setDbLoading(true);
-    const db = supabase(url, key);
-    Promise.all([db.getSettings(), db.getContacts()])
-      .then(([savedSettings, contacts]) => {
-        if (savedSettings) setSettings(prev => ({ ...prev, ...savedSettings, supabaseUrl: url, supabaseKey: key }));
-        if (contacts?.length) {
-          // getContacts() が既にアプリ内フィールド名にマッピング済み
-          setCrm(contacts);
-        }
-        setDbStatus({ ok: true });
-      })
-      .catch(e => setDbStatus({ ok: false, msg: e.message }))
+    const loadSettings = (url && key)
+      ? supabase(url, key).getSettings()
+          .then(savedSettings => {
+            if (savedSettings) setSettings(prev => ({ ...prev, ...savedSettings, supabaseUrl: url, supabaseKey: key }));
+          })
+          .catch(e => console.warn("Settings取得失敗 (無視):", e.message))
+      : Promise.resolve();
+
+    Promise.all([loadViaBackend, loadSettings])
       .finally(() => setDbLoading(false));
-  }, [settings.supabaseUrl, settings.supabaseKey]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 起動時 + 15分ごと: 学習重みをサーバーから取得
   useEffect(() => {
@@ -6085,15 +6127,37 @@ export default function App() {
   useEffect(() => { settingsRef.current = settings; }, [settings]);
 
   const syncContact = useCallback(async (contact) => {
-    const db = dbFromSettings(settingsRef.current);
-    if (!db) {
-      console.warn("DB未設定のためスキップ:", contact.name);
-      return;
-    }
+    // バックエンド経由でupsert（service_role → RLSバイパス）
+    const body = {
+      id:           contact.id,
+      name:         contact.name         || null,
+      title:        contact.title        || null,
+      company:      contact.company      || null,
+      industry:     contact.industry     || null,
+      email:        contact.email        || null,
+      linkedin:     contact.linkedinUrl  || contact.linkedin || null,
+      country:      contact.country      || null,
+      status:       contact.status       || "未送信",
+      score:        contact.score        || 0,
+      clicked:      contact.clicked      || false,
+      opens:        contact.opens        || 0,
+      ga_data:      contact.gaData       || null,
+      notes:        contact.notes        || null,
+      subject:      contact.subject      || null,
+      message_body: contact.messageBody  || null,
+      tracking_id:  contact.trackingId   || null,
+      sent_at:      contact.sentAt       || null,
+      added_at:     contact.addedAt      || new Date().toISOString(),
+      updated_at:   new Date().toISOString(),
+    };
     try {
-      await db.upsertContact(contact);
+      const r = await fetch(`${RAILWAY}/crm/contacts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
       setDbStatus(prev => ({ ...prev, ok: true, lastSync: new Date().toISOString() }));
-      console.log("✅ DB保存成功:", contact.name, contact.id);
     } catch (e) {
       console.error("❌ DB sync error:", e.message, "| contact:", contact.name, contact.id);
       setDbStatus({ ok: false, msg: `DB保存エラー: ${e.message}` });
@@ -6101,10 +6165,9 @@ export default function App() {
   }, []);
 
   const deleteContact = useCallback(async (id) => {
-    const db = dbFromSettings(settingsRef.current);
-    if (!db) return;
-    try { await db.deleteContact(id); }
-    catch (e) { console.error("DB delete error:", e.message); }
+    try {
+      await fetch(`${RAILWAY}/crm/contacts/${id}`, { method: "DELETE" });
+    } catch (e) { console.error("DB delete error:", e.message); }
   }, []);
 
   // CRM 更新 + DB 同期。updater 関数の外で副作用を発火する
