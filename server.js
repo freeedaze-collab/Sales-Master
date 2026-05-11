@@ -2536,31 +2536,102 @@ ${lines}
     let rawText = (geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
     rawText = rawText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
 
-    const rawDomainMap = {};
-    const jsonMatch = rawText.match(/\[[\s\S]*\]/);
-    if (jsonMatch) {
-      const arr = JSON.parse(jsonMatch[0]);
-      arr.forEach(item => {
-        if (typeof item.index === "number" && item.domain && candidateList[item.index]) {
-          rawDomainMap[candidateList[item.index].id] = item.domain;
-        }
-      });
+    // Geminiレスポンスをパース → { candidateId: domain }
+    function parseGeminiDomains(text, list) {
+      const result = {};
+      const m = text.match(/\[[\s\S]*\]/);
+      if (!m) return result;
+      try {
+        JSON.parse(m[0]).forEach(item => {
+          if (typeof item.index === "number" && item.domain && list[item.index]) {
+            result[list[item.index].id] = item.domain;
+          }
+        });
+      } catch {}
+      return result;
     }
 
-    // DNS 解決確認: 実在しないドメインを除外
-    const domainMap = {};
-    await Promise.all(
-      Object.entries(rawDomainMap).map(async ([id, domain]) => {
-        try {
-          await dns.resolve(domain);
-          domainMap[id] = domain;
-        } catch {
-          console.log(`⚠️ guess-domains: ${domain} はDNS未解決 → スキップ`);
-        }
-      })
-    );
+    // DNS解決チェック（並列）→ { ok: {id:domain}, failed: [id] }
+    async function checkDns(map) {
+      const ok = {}, failed = [];
+      await Promise.all(Object.entries(map).map(async ([id, domain]) => {
+        try { await dns.resolve(domain); ok[id] = domain; }
+        catch { failed.push(id); }
+      }));
+      return { ok, failed };
+    }
 
-    console.log(`🌐 guess-domains: ${candidateList.length}件 → ${Object.keys(rawDomainMap).length}件推測 → ${Object.keys(domainMap).length}件DNS確認済`);
+    // ── 初回推測 ──
+    const rawDomainMap = parseGeminiDomains(rawText, candidateList);
+    const { ok: domainMap, failed: failedIds } = await checkDns(rawDomainMap);
+
+    // 試行済みドメインを記録
+    const triedDomains = {};
+    Object.entries(rawDomainMap).forEach(([id, d]) => { triedDomains[id] = [d]; });
+
+    // ── DNS失敗分をリトライ（最大3回） ──
+    let retryIds = [...failedIds];
+    for (let attempt = 1; attempt <= 3 && retryIds.length > 0; attempt++) {
+      const retryCandidates = retryIds
+        .map(id => candidateList.find(c => c.id === id))
+        .filter(Boolean);
+
+      const retryLines = retryCandidates.map((c, i) =>
+        `${i}. ${c.name} | ${c.title || "?"} | ${c.company || "?"} | LinkedIn: ${c.linkedinUrl || "?"} | DNS解決失敗(使用不可): ${(triedDomains[c.id] || []).join(", ")} | rawTitle: ${(c.rawTitle || "").slice(0, 120)} | snippet: ${(c.rawSnippet || "").slice(0, 120)}`
+      ).join("\n");
+
+      const retryPrompt = `以下の人物について、企業の**メールドメイン**を再推測してください。
+
+【重要】以下のドメインはDNS解決に失敗しており実在しません。必ず別のドメインを返してください。
+
+${retryLines}
+
+純粋なJSON配列のみ返してください:
+[{"index":0,"domain":"example.com","company":"Example Corp","confidence":"high"}]
+
+ルール:
+- DNS失敗ドメインは絶対に再使用しない
+- 企業名の別スペルやパターンを試す（例: "Acme" → "acmecorp.com", "acme-corp.com", "theacme.com"）
+- 手がかりが少なくても最善の別パターンを必ず返す
+- 本当に不明な場合のみ domain を "" にする
+- gmail.com, yahoo.com 等の個人ドメインは使わない`;
+
+      const retryRes = await fetch(GEMINI_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: retryPrompt }] }],
+          generationConfig: { maxOutputTokens: 500, temperature: 0.4, responseMimeType: "application/json" },
+        }),
+      });
+      if (!retryRes.ok) break;
+
+      const retryData = await retryRes.json();
+      let retryText = (retryData.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+      retryText = retryText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+      const retryMap = parseGeminiDomains(retryText, retryCandidates);
+
+      // DNS確認
+      const nextRetry = [];
+      for (const [id, newDomain] of Object.entries(retryMap)) {
+        if (!newDomain) continue;
+        if ((triedDomains[id] || []).includes(newDomain)) { nextRetry.push(id); continue; }
+        triedDomains[id] = [...(triedDomains[id] || []), newDomain];
+        try {
+          await dns.resolve(newDomain);
+          domainMap[id] = newDomain;
+          console.log(`✅ retry${attempt}: ${newDomain} → DNS解決成功`);
+        } catch {
+          console.log(`⚠️ retry${attempt}: ${newDomain} も未解決`);
+          nextRetry.push(id);
+        }
+      }
+      // Geminiが空を返した候補はそのまま残す
+      retryIds.forEach(id => { if (!retryMap[id] && !domainMap[id]) nextRetry.push(id); });
+      retryIds = [...new Set(nextRetry)];
+    }
+
+    console.log(`🌐 guess-domains: ${candidateList.length}件 → ${Object.keys(domainMap).length}件DNS確認済 (${retryIds.length}件未解決)`);
     res.json({ domainMap });
   } catch (err) {
     console.error("guess-domains エラー:", err.message);
