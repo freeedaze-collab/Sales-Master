@@ -985,7 +985,7 @@ function SearchTab({ settings, crm, setCrm, prefill }) {
       for (const p of emailsToVerify) {
         const vr = resultMap[p.email.toLowerCase()];
         if (!vr || !vr.valid) {
-          setAdded(a => ({ ...a, [p.id]: vr ? `✗ ${vr.reason}` : "✗ error" }));
+          setAdded(a => ({ ...a, [p.id]: vr ? `✗ ${vr.reason || vr.status || "rejected"}` : "✗ error" }));
           continue;
         }
         if (crm.find(c => c.id === p.id)) {
@@ -1476,15 +1476,21 @@ function IntentSearchTab({ settings, crm, setCrm, prefill }) {
         let valid = 0, invalid = 0;
         for (let i = 0; i < targets.length; i++) {
           const contact = targets[i];
-          let newStatus = "invalid";
+          let newStatus = "unverified";
           try {
             const res = await fetch(`${RAILWAY}/email/verify-single`, {
               method: "POST", headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ email: contact.email }),
             });
-            if (res.ok) { const d = await res.json(); newStatus = d.valid ? "ready" : "invalid"; }
+            if (res.ok) {
+              const d = await res.json();
+              if (d.unverifiable || d.status === "unverifiable") newStatus = "unverified";
+              else if (d.valid) newStatus = "ready";
+              else if (d.status === "invalid") newStatus = "invalid";
+              else newStatus = "unverified"; // timeout/no_mx/unknown/catch_all/risky
+            }
           } catch {}
-          if (newStatus === "ready") valid++; else invalid++;
+          if (newStatus === "ready") valid++; else if (newStatus === "invalid") invalid++;
           setCrm(prev => prev.map(c => c.id === contact.id ? { ...c, status: newStatus } : c));
           setAutoCleanProgress({ done: i + 1, total: targets.length, valid, invalid });
           if (i < targets.length - 1) await new Promise(r => setTimeout(r, 150));
@@ -1614,7 +1620,7 @@ function IntentSearchTab({ settings, crm, setCrm, prefill }) {
         if (map[candidate.id]) {
           domain = map[candidate.id];
           setDomainOverride(prev => ({ ...prev, [candidate.id]: domain }));
-          setCandidates(prev => prev.map(c => c.id === candidate.id ? { ...c, guessedDomain: domain } : c));
+          setCandidates(prev => prev.map(c => c.id === candidate.id ? { ...c, guessedDomain: domain, domainVerified: true } : c));
         }
       } catch {}
       if (!domain) {
@@ -1649,7 +1655,8 @@ function IntentSearchTab({ settings, crm, setCrm, prefill }) {
         return {};
       }
       const data = await res.json();
-      return data.domainMap || {};
+      // fallbackDomainMap（DNS未確認）を domainMap（DNS確認済）で上書きしてマージ
+      return { ...(data.fallbackDomainMap || {}), ...(data.domainMap || {}) };
     } catch (e) {
       console.warn("ドメイン推測失敗:", e.message);
     }
@@ -1667,14 +1674,16 @@ function IntentSearchTab({ settings, crm, setCrm, prefill }) {
     setAutoVerifyRunning(true);
     autoVerifyAbort.current = false;
 
-    // Phase 1: ドメインがない候補のドメインを Gemini で推測
-    const needDomain = candidateList.filter(c => !c.email && !c.guessedDomain && !domainOverride[c.id]);
+    // Phase 1: ドメインが未確認（Gemini 未通過）の候補を Gemini で推測
+    const needDomain = candidateList.filter(c =>
+      !c.email && !domainOverride[c.id] && (!c.guessedDomain || !c.domainVerified)
+    );
     let domainMap = {};
     if (needDomain.length > 0) {
       setAutoVerifyProgress({ done: 0, total: candidateList.length, found: 0, phase: "ドメイン推測中..." });
       domainMap = await guessDomainWithAI(needDomain);
       if (Object.keys(domainMap).length > 0) {
-        setCandidates(prev => prev.map(c => domainMap[c.id] ? { ...c, guessedDomain: domainMap[c.id] } : c));
+        setCandidates(prev => prev.map(c => domainMap[c.id] ? { ...c, guessedDomain: domainMap[c.id], domainVerified: true } : c));
         setDomainOverride(prev => {
           const next = { ...prev };
           Object.entries(domainMap).forEach(([id, dom]) => { next[id] = dom; });
@@ -2902,114 +2911,114 @@ function ListTab({ crm, setCrm }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [crm]);  // crm を依存に入れて重複判定を最新にする (processCsvFile は同 crm closure を共有)
 
-  // ────────────────────────────────────────────
-  // 一括クリーニング
-  //   メアドあり → SMTP検証
-  //   メアドなし → ドメイン推測 → メアド推測 → SMTP検証
-  // ────────────────────────────────────────────
   const handleBulkClean = async () => {
     const targets = crm.filter(c => c.status === "unverified" || c.status === "未送信");
-    if (targets.length === 0) {
-      alert("未検証・未送信のリードがありません");
-      return;
-    }
-    const withEmail = targets.filter(c => c.email);
-    const noEmail   = targets.filter(c => !c.email);
+    if (targets.length === 0) { alert("未検証・未送信のリードがありません"); return; }
+    const FAKE_DOMAINS = new Set(["example.com","example.org","domain.com","test.com","placeholder.com","sample.com"]);
+    const isFake   = (email) => FAKE_DOMAINS.has((email || "").split("@")[1]);
+    const isMasked = (email) => /\*{2,}/.test(email || "");
+    const withEmail = targets.filter(c => c.email && !isFake(c.email) && !isMasked(c.email));
+    const noEmail   = targets.filter(c => !c.email || isFake(c.email) || isMasked(c.email));
     if (!window.confirm(`${targets.length}件を処理します（メアド検証: ${withEmail.length}件、メアド推測: ${noEmail.length}件）。続行しますか？`)) return;
 
     setCleaning(true);
     const total = targets.length;
-    setCleanProgress({ done: 0, total, valid: 0, invalid: 0 });
-    let valid = 0, invalid = 0, done = 0;
+    let done = 0, valid = 0, invalid = 0;
 
-    // ── Phase 1: メアドなし → ドメイン推測 → guess-and-verify ──
-    if (noEmail.length > 0) {
-      // ドメインがない分をまとめてGeminiに投げる
-      const needDomain = noEmail.filter(c => !(c.domain || c.guessedDomain));
-      let domainMap = {};
-      if (needDomain.length > 0) {
-        try {
-          const r = await fetch(`${RAILWAY}/search/guess-domains`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              candidates: needDomain.map(c => ({
-                id: c.id, name: c.name,
-                title: c.title || "", company: c.company || "",
-                linkedinUrl: c.linkedin || c.linkedinUrl || "",
-                rawTitle: (c.rawTitle || "").slice(0, 150),
-                rawSnippet: (c.rawSnippet || "").slice(0, 120),
-              })),
-            }),
-          });
-          if (r.ok) {
-            const d = await r.json();
-            domainMap = d.domainMap || {};
-            setCrm(prev => prev.map(c => domainMap[c.id] ? { ...c, guessedDomain: domainMap[c.id] } : c));
-          }
-        } catch (e) { console.warn("ドメイン推測エラー:", e.message); }
-      }
+    const naiveDomain = (company) => {
+      if (!company) return "";
+      const c = company.toLowerCase()
+        .replace(/\b(inc|corp|llc|ltd|co|group|company|holdings|technologies?|solutions?|services?|consulting|capital|ventures?|partners?)\b/g, "")
+        .replace(/[^a-z0-9]/g, "").trim();
+      return c.length >= 2 ? `${c}.com` : "";
+    };
 
-      for (let i = 0; i < noEmail.length; i++) {
-        const contact = noEmail[i];
-        const domain = domainMap[contact.id] || contact.domain || contact.guessedDomain || "";
-        if (!domain) {
-          invalid++;
-          done++;
-          setCleanProgress({ done, total, valid, invalid });
-          continue;
-        }
-        const nameParts = (contact.name || "").trim().split(/\s+/);
-        const firstName = nameParts[0] || "";
-        const lastName  = nameParts.slice(1).join(" ") || nameParts[0] || "";
-        try {
-          const r = await fetch(`${RAILWAY}/email/guess-and-verify`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ firstName, lastName, domain, name: contact.name, candidateId: contact.id }),
-          });
-          if (r.ok) {
-            const d = await r.json();
-            const email = d.verifiedEmail || d.bestGuess || null;
-            if (email) {
-              valid++;
-              const newStatus = d.verifiedEmail ? "ready" : "unverified";
-              setCrm(prev => prev.map(c => c.id === contact.id ? { ...c, email, status: newStatus } : c));
-            } else {
-              invalid++;
+    try {
+      // ── Phase 1: メアドなし → Gemini ドメイン推測 → guess-and-verify (SMTP + API) ──
+      if (noEmail.length > 0) {
+        setCleanProgress({ done, total, valid, invalid, phase: `ドメイン推測中… (${noEmail.length}件)` });
+        const needDomain = noEmail.filter(c => !(c.domain || c.guessedDomain));
+        let domainMap = {};
+        if (needDomain.length > 0) {
+          try {
+            const r = await fetch(`${RAILWAY}/search/guess-domains`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                candidates: needDomain.map(c => ({
+                  id: c.id, name: c.name, title: c.title || "", company: c.company || "",
+                  linkedinUrl: c.linkedin || c.linkedinUrl || "",
+                  rawTitle: (c.rawTitle || "").slice(0, 150),
+                })),
+              }),
+            });
+            if (r.ok) {
+              const d = await r.json();
+              for (const [id, dom] of Object.entries(d.domainMap || {})) { if (dom) domainMap[id] = dom; }
+              for (const [id, dom] of Object.entries(d.fallbackDomainMap || {})) { if (dom && !domainMap[id]) domainMap[id] = dom; }
             }
-          } else { invalid++; }
-        } catch (e) { console.warn("guess-and-verify エラー:", contact.name, e.message); invalid++; }
-        done++;
-        setCleanProgress({ done, total, valid, invalid });
-        if (i < noEmail.length - 1) await new Promise(r => setTimeout(r, 200));
-      }
-    }
-
-    // ── Phase 2: メアドあり → SMTP検証 ──
-    for (let i = 0; i < withEmail.length; i++) {
-      const contact = withEmail[i];
-      let newStatus = "invalid";
-      try {
-        const r = await fetch(`${RAILWAY}/email/verify-single`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: contact.email }),
-        });
-        if (r.ok) {
-          const d = await r.json();
-          newStatus = d.unverifiable ? "unverified" : (d.valid ? "ready" : "invalid");
+          } catch (e) { console.warn("guess-domains エラー:", e.message); }
         }
-      } catch (e) { console.warn("verify-single エラー:", contact.email, e.message); }
-      if (newStatus === "ready") valid++;
-      else invalid++;
-      setCrm(prev => prev.map(c => c.id === contact.id ? { ...c, status: newStatus } : c));
-      done++;
-      setCleanProgress({ done, total, valid, invalid });
-      if (i < withEmail.length - 1) await new Promise(r => setTimeout(r, 150));
-    }
 
-    setCleaning(false);
+        for (let i = 0; i < noEmail.length; i++) {
+          const contact = noEmail[i];
+          setCleanProgress({ done, total, valid, invalid, phase: `メアド推測・検証中… (${i + 1}/${noEmail.length})` });
+          const domain = domainMap[contact.id] || contact.domain || contact.guessedDomain || naiveDomain(contact.company);
+          if (domain) {
+            try {
+              const r = await fetch(`${RAILWAY}/email/guess-and-verify`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name: contact.name, domain }),
+              });
+              if (r.ok) {
+                const d = await r.json();
+                const email = d.verifiedEmail || d.bestGuess;
+                const newStatus = d.verifiedEmail ? "ready" : "unverified";
+                if (email) {
+                  if (d.verifiedEmail) valid++;
+                  setCrm(prev => prev.map(c => c.id === contact.id ? { ...c, email, status: newStatus, guessedDomain: domain } : c));
+                  syncContact({ ...contact, email, status: newStatus }).catch(() => {});
+                }
+              }
+            } catch (e) { console.warn("guess-and-verify エラー:", contact.name, e.message); }
+          }
+          done++;
+        }
+      }
+
+      // ── Phase 2: メアドあり → SMTP検証 ──
+      for (let i = 0; i < withEmail.length; i++) {
+        const contact = withEmail[i];
+        setCleanProgress({ done, total, valid, invalid, phase: `SMTP検証中… (${i + 1}/${withEmail.length})` });
+        let newStatus = "unverified";
+        try {
+          const r = await fetch(`${RAILWAY}/email/verify-single`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email: contact.email }),
+          });
+          if (r.ok) {
+            const d = await r.json();
+            if (d.valid || d.status === "catch_all")              newStatus = "ready";
+            else if (d.unverifiable || d.status === "unverifiable") newStatus = "unverified";
+            else if (d.status === "invalid")                        newStatus = "invalid";
+            else                                                     newStatus = "unverified";
+          }
+        } catch (e) { console.warn("verify-single エラー:", contact.email, e.message); }
+        if (newStatus === "ready") valid++;
+        else if (newStatus === "invalid") invalid++;
+        setCrm(prev => prev.map(c => c.id === contact.id ? { ...c, status: newStatus } : c));
+        syncContact({ ...contact, status: newStatus }).catch(() => {});
+        done++;
+        if (i < withEmail.length - 1) await new Promise(r => setTimeout(r, 150));
+      }
+
+    } catch (e) {
+      console.error("handleBulkClean エラー:", e);
+    } finally {
+      setCleaning(false);
+    }
   };
 
   const handleAdd = () => {
@@ -3262,18 +3271,18 @@ function ListTab({ crm, setCrm }) {
       {cleaning && cleanProgress && (
         <div style={{ marginBottom: 12, padding: "12px 14px", borderRadius: 8, background: "#E6F1FB", border: "0.5px solid #ADC8E8" }}>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6, fontSize: 13, color: "#0C447C", fontWeight: 500 }}>
-            <span>🔍 メール検証中...</span>
+            <span>🔍 {cleanProgress.phase || "メール検証中…"}</span>
             <span>{cleanProgress.done} / {cleanProgress.total}件</span>
           </div>
           <div style={{ height: 6, background: "#BDD6EF", borderRadius: 100, overflow: "hidden" }}>
             <div style={{
               height: "100%", borderRadius: 100,
-              width: `${(cleanProgress.done / cleanProgress.total) * 100}%`,
+              width: `${cleanProgress.total ? (cleanProgress.done / cleanProgress.total) * 100 : 0}%`,
               background: "#185FA5", transition: "width .2s",
             }} />
           </div>
           <div style={{ marginTop: 6, fontSize: 12, color: "#378ADD" }}>
-            ✓ 有効: {cleanProgress.valid}件 &nbsp;·&nbsp; ✗ 無効: {cleanProgress.invalid}件
+            ✅ 取得済み: {cleanProgress.valid}件 &nbsp;·&nbsp; ❌ 無効: {cleanProgress.invalid}件
           </div>
         </div>
       )}

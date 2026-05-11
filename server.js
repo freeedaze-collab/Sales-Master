@@ -6,6 +6,8 @@
  *   npm install express cors uuid googleapis
  */
 
+require("dotenv").config({ path: require("path").join(__dirname, ".env") });
+
 const express = require("express");
 const cors = require("cors");
 const { randomUUID: uuidv4 } = require("crypto");
@@ -395,6 +397,148 @@ async function verifyEmailViaProvider(email) {
 }
 
 // ══════════════════════════════════════════════
+// Brave+Gemini Webサーチでメアド発見
+// POST /email/web-find
+//   { name, company, domain?, firstName?, lastName? }
+//   → { email, domain, format, confidence }
+// ══════════════════════════════════════════════
+app.post("/email/web-find", async (req, res) => {
+  const { name, company, domain, firstName, lastName } = req.body;
+  console.log(`📥 web-find 受信: ${name} / ${company}`);
+  const geminiKey = CONFIG.GEMINI_API_KEY;
+  if (!geminiKey || !BRAVE_API_KEY) return res.json({ email: null, confidence: "none" });
+
+  const fn = (firstName || (name || "").split(/\s+/)[0] || "").toLowerCase().replace(/[^a-z]/g, "");
+  const ln = (lastName || (name || "").split(/\s+/).slice(1).join(" ") || "").toLowerCase().replace(/[^a-z]/g, "");
+  const targetDomain = (domain || "").trim();
+  const companyName  = (company || "").trim();
+
+  // 2クエリ並行検索
+  const queries = targetDomain
+    ? [`"@${targetDomain}"`, `site:${targetDomain} contact OR team`]
+    : [`"${companyName}" email contact`, `"${companyName}" "@" email format`];
+
+  let snippets = "";
+  await Promise.all(queries.map(async (q) => {
+    try {
+      const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=5`;
+      const r = await fetch(url, {
+        headers: { "Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!r.ok) return;
+      const data = await r.json();
+      (data?.web?.results || []).forEach(x => {
+        snippets += `URL: ${x.url}\nSnippet: ${x.description || ""}\n---\n`;
+      });
+    } catch (_) {}
+  }));
+
+  if (!snippets.trim()) return res.json({ email: null, confidence: "none" });
+
+  const prompt = `以下はウェブ検索の結果です。この会社（${companyName}${targetDomain ? `、domain: ${targetDomain}` : ""}）が使っているメールアドレスのパターンを特定し、この人物のメアドを生成してください。
+
+検索結果:
+${snippets.slice(0, 3000)}
+
+対象人物:
+氏名: ${name || `${fn} ${ln}`}
+firstName(小文字): ${fn}
+lastName(小文字): ${ln}
+${targetDomain ? `ドメイン: ${targetDomain}` : ""}
+
+ルール:
+- 検索結果にメールのパターン・実例があればそれを最優先
+- なければ一般的なパターンを使う (優先: firstname.lastname@ > flastname@ > firstname@)
+- gmail.com/yahoo.com 等の個人ドメインは使わない
+- ドメインが不明な場合は会社名から推測
+
+JSONのみ返してください（説明文不要）:
+{"email":"best@guess.com","domain":"guess.com","format":"{first}.{last}@domain.com","confidence":"high|medium|low"}
+
+手がかりがまったくない場合のみ: {"email":null,"confidence":"none"}`;
+
+  try {
+    const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`;
+    const r = await fetch(GEMINI_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.1, maxOutputTokens: 1000, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!r.ok) return res.json({ email: null, confidence: "none" });
+
+    const data = await r.json();
+    let text = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+    text = text.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch (_) {
+      const m = text.match(/\{[\s\S]*\}/);
+      if (!m) return res.json({ email: null, confidence: "none" });
+      try { parsed = JSON.parse(m[0]); } catch (_2) { return res.json({ email: null, confidence: "none" }); }
+    }
+    if (!parsed.email || !parsed.email.includes("@")) return res.json({ email: null, confidence: "none" });
+
+    const emailDomain = parsed.email.split("@")[1] || "";
+    if (["gmail.com","yahoo.com","hotmail.com","outlook.com","icloud.com"].includes(emailDomain)) {
+      return res.json({ email: null, confidence: "none" });
+    }
+
+    console.log(`✓ web-find: ${name} → ${parsed.email} (${parsed.confidence})`);
+    res.json(parsed);
+  } catch (e) {
+    console.warn("web-find error:", e.message);
+    res.json({ email: null, confidence: "none" });
+  }
+});
+
+// ══════════════════════════════════════════════
+// Apollo人物エンリッチ — メアド取得
+// POST /email/apollo-enrich
+//   { linkedinUrl?, firstName?, lastName?, company?, domain? }
+// ══════════════════════════════════════════════
+app.post("/email/apollo-enrich", async (_req, res) => {
+  // Apollo people/match は現在のAPIキーでは401が返るため無効化
+  return res.json({ email: null, emailStatus: "unavailable" });
+  const { linkedinUrl, firstName, lastName, company, domain } = _req.body;
+  const key = CONFIG.APOLLO_KEY;
+  if (!key) return res.json({ email: null, emailStatus: "unavailable" });
+
+  const body = { reveal_personal_emails: false, reveal_phone_number: false };
+  if (linkedinUrl) body.linkedin_url = linkedinUrl;
+  if (firstName)   body.first_name = firstName;
+  if (lastName)    body.last_name  = lastName;
+  if (company)     body.organization_name = company;
+  if (domain)      body.domain = domain;
+
+  try {
+    const r = await fetch("https://api.apollo.io/api/v1/people/match", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, api_key: key }),
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!r.ok) {
+      console.warn(`Apollo enrich HTTP ${r.status}`);
+      return res.json({ email: null, emailStatus: "unavailable" });
+    }
+    const data = await r.json();
+    const person = data?.person;
+    if (!person || !person.email) return res.json({ email: null, emailStatus: "unavailable" });
+
+    const emailStatus = person.email_status || "guessed";
+    console.log(`✓ apollo-enrich: ${person.name} → ${person.email} (${emailStatus})`);
+    res.json({ email: person.email, emailStatus, name: person.name });
+  } catch (e) {
+    console.warn("apollo-enrich error:", e.message);
+    res.json({ email: null, emailStatus: "unavailable" });
+  }
+});
+
+// ══════════════════════════════════════════════
 // 単一メアド検証 — SMTP プローブ
 // POST /email/verify-single  { email: string }
 // ══════════════════════════════════════════════
@@ -413,12 +557,34 @@ app.post("/email/verify-single", async (req, res) => {
 
   const r = smtpResult.results[0];
   const provider = smtpResult.provider || "unknown";
-  const unverifiable = provider === "google" || provider === "microsoft365";
-  const valid = r.status === "valid";
+  const isProviderBlocked = ["google", "microsoft365", "security_gateway"].includes(provider);
 
-  console.log(`✓ verify-single [SMTP/${provider}]: ${email} → ${r.status} (valid=${valid}, unverifiable=${unverifiable})`);
+  let valid = r.status === "valid";
+  let status = r.status;
+  let unverifiable = false;
 
-  res.json({ email, valid, unverifiable, provider, status: r.status, reason: r.reason || null });
+  // Google/Microsoft/security_gateway は SMTP で検証不可 → verifyEmailViaProvider() で試す
+  if (!valid && isProviderBlocked) {
+    const pvRes = await verifyEmailViaProvider(email).catch(() => null);
+    if (!pvRes || pvRes.reason === "no_api_key") {
+      unverifiable = true;
+      status = "unverifiable";
+    } else if (pvRes.valid) {
+      valid = true;
+      status = "valid";
+    } else if (pvRes.reason === "catch_all") {
+      status = "catch_all";
+    } else if (pvRes.status === "invalid" || pvRes.reason === "invalid") {
+      status = "invalid";
+    } else {
+      unverifiable = true;
+      status = pvRes.status || "unverifiable";
+    }
+  }
+
+  console.log(`✓ verify-single [${provider}]: ${email} → ${status} (valid=${valid}, unverifiable=${unverifiable})`);
+
+  res.json({ email, valid, unverifiable, provider, status, reason: r.reason || null });
 });
 
 app.post("/email/verify-emailverify", async (req, res) => {
@@ -933,6 +1099,11 @@ app.post("/webhook/ses", async (req, res) => {
   if (payload.Type === "SubscriptionConfirmation" && payload.SubscribeURL) {
     console.log("📩 SNS SubscriptionConfirmation — 自動確認中…");
     try {
+      const subUrl = new URL(payload.SubscribeURL);
+      if (!subUrl.hostname.endsWith(".amazonaws.com")) {
+        console.error("✗ SNS SubscribeURL が AWS ドメイン外:", subUrl.hostname);
+        return res.status(400).json({ error: "invalid SubscribeURL" });
+      }
       await fetch(payload.SubscribeURL);
       console.log("✓ SNS Subscription 確認完了");
     } catch (e) {
@@ -1344,12 +1515,11 @@ app.get("/track/open/:trackingId", (req, res) => {
 
 app.get("/track/click/:trackingId", (req, res) => {
   const record = trackingStore[req.params.trackingId];
-  const redirectUrl = req.query.redirect || CONFIG.CLICK_REDIRECT_URL;
   if (record) {
     record.clicks++;
     if (!record.clickedAt) record.clickedAt = new Date().toISOString();
   }
-  res.redirect(redirectUrl);
+  res.redirect(CONFIG.CLICK_REDIRECT_URL || "/");
 });
 
 app.get("/track/status", (_req, res) => {
@@ -1972,7 +2142,7 @@ app.get("/health", (_req, res) => {
 // ══════════════════════════════════════════════════════════════
 // 設定追加（CONFIG オブジェクトに追記するか、ここで参照）
 // ══════════════════════════════════════════════════════════════
-const BRAVE_API_KEY = process.env.BRAVE_API_KEY || "BSAa57ptg3zN_mpPrzv-C3IW1Vlt8VC";
+const BRAVE_API_KEY = process.env.BRAVE_API_KEY || null;
 
 // ── X-Ray 検索クエリのパターン ──
 const LINKEDIN_SITE_QUERY = "site:linkedin.com/in";
@@ -1988,7 +2158,7 @@ function smtpSession(host, recipients) {
   return new Promise((resolve) => {
     const socket = net.createConnection({ host, port: 25 });
     socket.setEncoding('utf8');
-    socket.setTimeout(12000);
+    socket.setTimeout(25000);
     const results = recipients.map(r => ({ rcpt: r, code: null, message: '' }));
     let buf = '', phase = 'greet', idx = 0;
     const send = l => socket.write(l + '\r\n');
@@ -2039,10 +2209,12 @@ async function smtpVerifyBatch(domain, candidateEmails) {
   }
   const probe = `xq8z9k${Date.now().toString(36)}-noexist@${domain}`;
   const session = await smtpSession(mxHost, [probe, ...candidateEmails]);
-  const isCatchAll = session.results[0]?.code >= 200 && session.results[0]?.code < 300;
+  const probeCode = session.results[0]?.code ?? null;
+  const probeTimedOut = probeCode === null;
+  const isCatchAll = probeCode !== null && probeCode >= 200 && probeCode < 300;
   const results = session.results.slice(1).map(r => {
     if (r.code === null) return { email: r.rcpt, status: 'unknown', reason: session.reason };
-    if (r.code >= 200 && r.code < 300) return { email: r.rcpt, status: isCatchAll ? 'catch_all' : 'valid', code: r.code };
+    if (r.code >= 200 && r.code < 300) return { email: r.rcpt, status: (isCatchAll || probeTimedOut) ? 'catch_all' : 'valid', code: r.code };
     if (r.code >= 400 && r.code < 500) return { email: r.rcpt, status: 'risky', code: r.code };
     return { email: r.rcpt, status: 'invalid', code: r.code, reason: r.message };
   });
@@ -2055,7 +2227,7 @@ async function smtpVerifyBatch(domain, candidateEmails) {
 function generateEmailGuesses(firstName, lastName, domain) {
   const f = (firstName || "").toLowerCase().trim().replace(/[^a-z]/g, "");
   const l = (lastName  || "").toLowerCase().trim().replace(/[^a-z]/g, "");
-  const d = (domain    || "").toLowerCase().trim();
+  const d = (domain    || "").toLowerCase().trim().replace(/\.$/, "");
   if (!d) return [];
   if (!f && !l) return [];
 
@@ -2193,6 +2365,7 @@ function parseLinkedInCandidate(item) {
     company:       company || "",
     linkedinUrl:   link,
     guessedDomain: guessedDomain,
+    domainVerified: false,  // Gemini/DNS 未確認の naive 推測
     rawTitle,
     rawSnippet,
     status:        "未送信",
@@ -2355,9 +2528,15 @@ site:linkedin.com/in (CFO OR "Head of Finance") (FinTech OR "crypto" OR "web3" O
       });
     }
 
-    // Brave のレスポンスを parseLinkedInCandidate 互換の形式に変換
+    // Brave のレスポンスを parseLinkedInCandidate 互換の形式に変換（URL 重複除去）
+    const seenUrls = new Set();
     const linkedinItems = webResults
-      .filter(item => (item.url || "").includes("linkedin.com/in/"))
+      .filter(item => {
+        const url = (item.url || "").split("?")[0].replace(/\/$/, "");
+        if (!url.includes("linkedin.com/in/") || seenUrls.has(url)) return false;
+        seenUrls.add(url);
+        return true;
+      })
       .map(item => ({
         title:   item.title || "",
         snippet: item.description || "",
@@ -2431,8 +2610,9 @@ ${candidateSummaries}
 
       const jsonMatch = refineText.match(/\[[\s\S]*\]/);
       if (jsonMatch) {
-        const refined = JSON.parse(jsonMatch[0]);
-        if (Array.isArray(refined) && refined.length > 0) {
+        let refined;
+        try { refined = JSON.parse(jsonMatch[0]); } catch { refined = null; }
+        if (refined && Array.isArray(refined) && refined.length > 0) {
           const refinedCandidates = refined
             .filter(r => typeof r.index === "number" && r.index >= 0 && r.index < candidates.length)
             .map(r => ({
@@ -2476,6 +2656,7 @@ app.post("/search/guess-domains", async (req, res) => {
   }
 
   const { candidates: candidateList } = req.body;
+  console.log(`📥 guess-domains 受信: ${Array.isArray(candidateList) ? candidateList.length : 0}件`);
   if (!Array.isArray(candidateList) || candidateList.length === 0) {
     return res.status(400).json({ error: "candidates 配列が必要です" });
   }
@@ -2513,26 +2694,35 @@ ${lines}
 
     const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`;
 
-    const geminiRes = await fetch(GEMINI_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          maxOutputTokens: 1000,
-          temperature: 0.2,
-          responseMimeType: "application/json",
-        },
-      }),
-    });
-
-    if (!geminiRes.ok) {
+    // Gemini 503/429 はリトライ（最大3回、指数バックオフ）
+    let geminiData = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 1200 * attempt));
+      const geminiRes = await fetch(GEMINI_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            maxOutputTokens: 8000,
+            temperature: 0.2,
+            responseMimeType: "application/json",
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        }),
+      });
+      if (geminiRes.ok) {
+        geminiData = await geminiRes.json();
+        break;
+      }
       const errText = await geminiRes.text();
-      console.error("guess-domains Gemini error:", errText.slice(0, 300));
-      return res.status(500).json({ error: `Gemini API ${geminiRes.status}`, domainMap: {} });
+      console.error(`guess-domains Gemini error (attempt ${attempt + 1}):`, geminiRes.status, errText.slice(0, 200));
+      if (geminiRes.status !== 503 && geminiRes.status !== 429) break; // 再試行不要なエラー
     }
 
-    const geminiData = await geminiRes.json();
+    if (!geminiData) {
+      return res.json({ domainMap: {}, fallbackDomainMap: {}, error: "Gemini API unavailable" });
+    }
     let rawText = (geminiData.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
     rawText = rawText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
 
@@ -2555,7 +2745,7 @@ ${lines}
     async function checkDns(map) {
       const ok = {}, failed = [];
       await Promise.all(Object.entries(map).map(async ([id, domain]) => {
-        try { await dns.resolve(domain); ok[id] = domain; }
+        try { await dns.resolveMx(domain); ok[id] = domain; }
         catch { failed.push(id); }
       }));
       return { ok, failed };
@@ -2601,7 +2791,7 @@ ${retryLines}
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ parts: [{ text: retryPrompt }] }],
-          generationConfig: { maxOutputTokens: 500, temperature: 0.4, responseMimeType: "application/json" },
+          generationConfig: { maxOutputTokens: 4000, temperature: 0.4, responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 0 } },
         }),
       });
       if (!retryRes.ok) break;
@@ -2618,7 +2808,7 @@ ${retryLines}
         if ((triedDomains[id] || []).includes(newDomain)) { nextRetry.push(id); continue; }
         triedDomains[id] = [...(triedDomains[id] || []), newDomain];
         try {
-          await dns.resolve(newDomain);
+          await dns.resolveMx(newDomain);
           domainMap[id] = newDomain;
           console.log(`✅ retry${attempt}: ${newDomain} → DNS解決成功`);
         } catch {
@@ -2631,8 +2821,21 @@ ${retryLines}
       retryIds = [...new Set(nextRetry)];
     }
 
-    console.log(`🌐 guess-domains: ${candidateList.length}件 → ${Object.keys(domainMap).length}件DNS確認済 (${retryIds.length}件未解決)`);
-    res.json({ domainMap });
+    // DNS未解決でもGeminiの初回推測をフォールバックとして返す
+    // フロントエンドはDNS確認済みを優先し、なければフォールバックを使う
+    const fallbackDomainMap = {};
+    for (const [id, d] of Object.entries(rawDomainMap)) {
+      if (!domainMap[id] && d) fallbackDomainMap[id] = d;
+    }
+    // リトライで試みたドメインもフォールバックに追加（最後に試したもの）
+    for (const id of retryIds) {
+      if (!domainMap[id] && triedDomains[id]?.length) {
+        fallbackDomainMap[id] = triedDomains[id][triedDomains[id].length - 1];
+      }
+    }
+
+    console.log(`🌐 guess-domains: ${candidateList.length}件 → ${Object.keys(domainMap).length}件DNS確認済 / ${Object.keys(fallbackDomainMap).length}件フォールバック (${retryIds.length}件未解決)`);
+    res.json({ domainMap, fallbackDomainMap });
   } catch (err) {
     console.error("guess-domains エラー:", err.message);
     res.status(500).json({ error: err.message, domainMap: {} });
@@ -2717,14 +2920,12 @@ JSON のみ返してください（説明文不要）:
     }
   }
 
-  // lastNameが依然空なら firstName を両方に使う（単名の場合: john@, john.john@は除外されるのでfirstnameのみパターンが出る）
-  if (!lastName) lastName = firstName;
-
   const guesses = generateEmailGuesses(firstName, lastName, domain);
   if (guesses.length === 0) {
     // 最終フォールバック: firstName のみでパターン生成
-    const fallbackGuesses = [`${firstName.toLowerCase().replace(/[^a-z]/g, "")}@${domain}`];
-    if (fallbackGuesses[0].length > domain.length + 2) {
+    const cleanedFirst = firstName.toLowerCase().replace(/[^a-z]/g, "");
+    if (cleanedFirst.length >= 1) {
+      const fallbackGuesses = [`${cleanedFirst}@${domain}`];
       return res.json({
         candidateId, guesses: fallbackGuesses, verifiedEmail: null,
         allResults: [{ email: fallbackGuesses[0], valid: false, status: "unverified", reason: "fallback_pattern" }],
@@ -2747,14 +2948,24 @@ JSON のみ返してください（説明文不要）:
     code:   r.code   || null,
   }));
   const provider = smtpResult.provider || 'unknown';
-  const verifiedEmail = allResults.find(r => r.valid)?.email || null;
+  let verifiedEmail = allResults.find(r => r.valid)?.email || null;
 
-  // Google/Microsoft365 はSMTP検証不可 → 最有力パターンをbestGuessとして返す
-  // パターン優先順: firstname.lastname@ → flastname@ → firstname@
-  let bestGuess = null;
-  if (!verifiedEmail && (provider === 'google' || provider === 'microsoft365')) {
-    bestGuess = guesses[0] || null;
+  // Google/Microsoft/security_gateway は SMTP では検証不可 → verifyEmailViaProvider() で上位3パターンを試す
+  if (!verifiedEmail && ['google', 'microsoft365', 'security_gateway'].includes(provider)) {
+    const verifyKey = process.env.VERIFY_API_KEY || CONFIG.EMAILVERIFY_API_KEY;
+    if (verifyKey) {
+      const topGuesses = guesses.slice(0, 3);
+      for (const email of topGuesses) {
+        const pvRes = await verifyEmailViaProvider(email).catch(() => null);
+        if (pvRes?.valid) { verifiedEmail = email; break; }
+      }
+    }
   }
+
+  // SMTP確認できなかった場合は全プロバイダーで最有力パターンをbestGuessとして返す
+  // (no_mx/timeout いずれもパターン推測を返す)
+  // パターン優先順: firstname.lastname@ → flastname@ → firstname@
+  const bestGuess = verifiedEmail ? null : (guesses[0] || null);
 
   console.log(`📧 guess-and-verify: ${firstName} ${lastName} @ ${domain} [${provider}] → ${verifiedEmail || bestGuess || "not found"} (${allResults.length}パターン試行)`);
 
@@ -3010,12 +3221,12 @@ app.post("/linkedin/send", async (req, res) => {
       }
     }
 
-    console.log(`🔗 LinkedIn 招待送信: ${name} (${linkedinId}) | trackingId: ${trackingId}`);
+    console.log(`🔗 LinkedIn 招待送信: ${name} (${publicIdentifier}) | trackingId: ${trackingId}`);
 
     res.json({
       ok:              true,
       trackingId,
-      linkedinId,
+      linkedinId:      publicIdentifier,
       messageUsed:     finalMessage,
       messageLength:   finalMessage.length,
       unipileResponse: unipileData,
@@ -3259,7 +3470,10 @@ app.delete("/crm/contacts/:id", async (req, res) => {
     setTimeout(async () => {
       try {
         await syncGA4ToTrackingStore();
-        setInterval(syncGA4ToTrackingStore, 15 * 60 * 1000);
+        setInterval(async () => {
+          try { await syncGA4ToTrackingStore(); }
+          catch (e) { console.error("GA4 定期 sync エラー:", e.message); }
+        }, 15 * 60 * 1000);
       } catch (e) { console.error("GA4 sync エラー:", e.message); }
     }, 30 * 1000);
   });
