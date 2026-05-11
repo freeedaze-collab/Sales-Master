@@ -395,7 +395,7 @@ async function verifyEmailViaProvider(email) {
 }
 
 // ══════════════════════════════════════════════
-// 単一メアド検証 — VERIFY_PROVIDER で切替
+// 単一メアド検証 — SMTP プローブ
 // POST /email/verify-single  { email: string }
 // ══════════════════════════════════════════════
 app.post("/email/verify-single", async (req, res) => {
@@ -404,14 +404,21 @@ app.post("/email/verify-single", async (req, res) => {
     return res.status(400).json({ error: "email が必要です" });
   }
 
-  const result = await verifyEmailViaProvider(email);
-  console.log(`✓ verify-single [${process.env.VERIFY_PROVIDER || "millionverifier"}]: ${email} → ${result.status} (valid=${result.valid})`);
+  const domain = email.split("@")[1];
+  if (!domain) return res.status(400).json({ error: "不正なメールアドレス形式" });
 
-  if (result.mock) {
-    console.warn(`⚠️  VERIFY_API_KEY 未設定 — ${email} は検証されず unknown 扱い`);
-  }
+  const smtpResult = await smtpVerifyBatch(domain, [email]).catch(e => ({
+    domain, provider: "error", results: [{ email, status: "unknown", reason: e.message }]
+  }));
 
-  res.json({ email, ...result });
+  const r = smtpResult.results[0];
+  const provider = smtpResult.provider || "unknown";
+  const unverifiable = provider === "google" || provider === "microsoft365";
+  const valid = r.status === "valid";
+
+  console.log(`✓ verify-single [SMTP/${provider}]: ${email} → ${r.status} (valid=${valid}, unverifiable=${unverifiable})`);
+
+  res.json({ email, valid, unverifiable, provider, status: r.status, reason: r.reason || null });
 });
 
 app.post("/email/verify-emailverify", async (req, res) => {

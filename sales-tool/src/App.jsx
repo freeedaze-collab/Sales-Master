@@ -1775,7 +1775,10 @@ function IntentSearchTab({ settings, crm, setCrm, prefill }) {
       ...candidate,
       linkedin:    liUrl,
       linkedinUrl: liUrl,
-      status:      approachMode === "linkedin" ? "LinkedIn送信待ち" : (candidate.status || "未送信"),
+      status:      approachMode === "linkedin" ? "LinkedIn送信待ち" :
+                   candidate._verifyStatus === "valid" ? "ready" :
+                   candidate.email ? "unverified" :
+                   "未送信",
       addedAt:     new Date().toISOString(),
       clicks: 0, opens: 0, gaData: null, notes: "",
       subject: "", messageBody: "", trackingId: null,
@@ -2903,9 +2906,9 @@ function ListTab({ crm, setCrm }) {
   // 一括クリーニング（未検証リードを検証API呼び出し）
   // ────────────────────────────────────────────
   const handleBulkClean = async () => {
-    const unverified = crm.filter(c => c.status === "unverified" && c.email);
+    const unverified = crm.filter(c => (c.status === "unverified" || c.status === "未送信") && c.email);
     if (unverified.length === 0) {
-      alert("未検証（unverified）かつメールアドレスがあるリードがありません");
+      alert("メールアドレスがあるリードがありません");
       return;
     }
     if (!window.confirm(`${unverified.length}件のメールアドレスを検証します。時間がかかる場合があります。続行しますか？`)) return;
@@ -2927,7 +2930,12 @@ function ListTab({ crm, setCrm }) {
         });
         if (res.ok) {
           const data = await res.json();
-          newStatus = data.valid ? "ready" : "invalid";
+          if (data.unverifiable) {
+            // Google/Microsoft は SMTP検証不可 → unverified のまま維持
+            newStatus = "unverified";
+          } else {
+            newStatus = data.valid ? "ready" : "invalid";
+          }
         }
       } catch (err) {
         console.warn("verify-single エラー:", contact.email, err.message);
@@ -2969,7 +2977,7 @@ function ListTab({ crm, setCrm }) {
     setShowAddForm(false);
   };
 
-  const unverifiedCount = crm.filter(c => c.status === "unverified" && c.email).length;
+  const unverifiedCount = crm.filter(c => (c.status === "unverified" || c.status === "未送信") && c.email).length;
 
   const statusFilters = FILTER_OPTIONS.filter(f => f.type === "all" || f.type === "status");
   const gaFilters     = FILTER_OPTIONS.filter(f => f.type === "flag" || f.type === "ga" || f.type === "plan");
